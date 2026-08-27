@@ -6,14 +6,18 @@
 # nesta branch.
 #
 # ATENCAO: DataBucketName nao tem default no template porque nome de bucket S3
-# e globalmente unico. Troque o placeholder abaixo ANTES do primeiro sync, ou o
-# deploy falha em CREATE_FAILED no recurso DataBucket.
+# e globalmente unico. Troque o placeholder abaixo ANTES do primeiro sync.
+# Ele e propositalmente invalido (maiusculas) para o template barrar na
+# validacao do change set, com mensagem clara, em vez de quebrar no meio do
+# create. Regras do S3: 3 a 63 caracteres, so minusculas, digitos, ponto e
+# hifen, comecando e terminando com letra ou digito.
+# Sugestao: iot-telemetry-data-<account-id>-<regiao>
 
 template-file-path: template.yaml
 
 parameters:
   ProjectName: iot-telemetry
-  DataBucketName: iot-telemetry-data-CHANGE-ME
+  DataBucketName: TROQUE-POR-UM-NOME-DE-BUCKET-UNICO
   MqttTopicFilter: devices/+/telemetry
   RollupLookbackHours: '3'
   HotStoreTtlDays: '45'

@@ -14,6 +14,13 @@ Parameters:
 
   DataBucketName:
     Type: String
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    ConstraintDescription: >
+      Nome de bucket S3 valido: 3 a 63 caracteres, apenas minusculas, digitos,
+      ponto e hifen, comecando e terminando com letra ou digito. Maiuscula e
+      underscore sao rejeitados pelo S3.
     Description: >
       Nome do bucket S3 criado por esta pilha (warehouse Iceberg, erros do
       Firehose e script do Glue Job). Precisa ser globalmente unico.

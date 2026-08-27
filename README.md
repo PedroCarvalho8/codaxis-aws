@@ -23,8 +23,17 @@ rollup_job.py         # script do Glue Job (vai para o S3, não para a pilha)
 | Stack name | `iot-telemetry` (ou o que preferir) |
 
 Antes do primeiro sync, **edite `DataBucketName`** em `deployment-file.yaml` —
-nome de bucket S3 é globalmente único e o parâmetro não tem default, então o
-placeholder `iot-telemetry-data-CHANGE-ME` derruba o deploy em `CREATE_FAILED`.
+nome de bucket S3 é globalmente único e o parâmetro não tem default. O
+placeholder é propositalmente inválido, e o template valida o formato
+(`AllowedPattern`), então um nome fora das regras do S3 é barrado já na
+validação do change set em vez de estourar no meio do create. Regras: 3 a 63
+caracteres, só minúsculas, dígitos, ponto e hífen, começando e terminando com
+letra ou dígito. `iot-telemetry-data-<account-id>-<região>` costuma resolver a
+unicidade.
+
+Se um deploy falhar no `CREATE`, a pilha para em `ROLLBACK_COMPLETE` — estado
+que não aceita update. **Push de correção não conserta**: delete a pilha no
+console primeiro, e o sync seguinte recria do zero.
 
 A role de IAM que o Git sync assume precisa poder criar os recursos da pilha,
 inclusive as roles de IAM que ela declara (equivale ao `CAPABILITY_IAM` do
