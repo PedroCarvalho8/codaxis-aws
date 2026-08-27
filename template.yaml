@@ -118,8 +118,9 @@ Resources:
       TableInput:
         Name: telemetry_raw
         TableType: EXTERNAL_TABLE
+        # table_type e metadata_location sao reservados: o IcebergInput acima
+        # os define, e o Glue rejeita a criacao se vierem declarados aqui.
         Parameters:
-          table_type: ICEBERG
           format: parquet
           write.parquet.compression-codec: zstd
         StorageDescriptor:
