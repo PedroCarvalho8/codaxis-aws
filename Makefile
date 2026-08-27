@@ -10,6 +10,7 @@ check:  ## nao altera nada; e o que o CI roda
 	python3 build/assemble.py --check
 	cfn-lint template.yaml
 	python3 -m compileall -q glue lambdas
+	python3 tests/test_geohash.py
 	python3 tests/test_api_handler.py
 
 test: check

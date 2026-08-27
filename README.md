@@ -18,8 +18,11 @@ infra/                   # fontes do template
   resources/             #   um arquivo por domínio, concatenados em ordem
     10-armazenamento.yaml
     20-catalogo-iceberg.yaml
+    25-posicoes-iceberg.yaml
     30-firehose.yaml
+    35-posicoes-firehose.yaml
     40-iot-core.yaml
+    45-posicoes-iot.yaml
     50-dynamodb.yaml
     60-glue-job.yaml
     70-api.yaml
@@ -28,9 +31,11 @@ infra/                   # fontes do template
 glue/rollup_job.py       # script do Glue Job
 lambdas/                 # handlers, um arquivo por função
   firehose_transform.py
+  firehose_position_transform.py
   s3_writer.py
   api_query.py
   api_catalog.py
+  api_heatmap.py
 frontend/index.html      # dashboard
 
 build/assemble.py        # monta template.yaml a partir do que está acima
@@ -214,6 +219,36 @@ array, a informação do tópico não acompanha o registro.
 `batch_id` + `seq` é o par que permite deduplicar retry: o job faz
 `dropDuplicates` sobre eles antes de agregar.
 
+## Posição dos tratores
+
+Caminho de ingestão **paralelo**, em tópico e stream próprios:
+
+```
+devices/+/position → regra IoT → Firehose → positions_raw (Iceberg)
+```
+
+```json
+{"positions": [
+  {"device_id":"trator-01","event_time":"2026-08-27T14:00:00Z",
+   "lat":-23.5505,"lon":-46.6333,"speed":8.2,"heading":137,
+   "batch_id":"b-1","seq":0}
+]}
+```
+
+`speed`, `heading` e `altitude` são opcionais — o job deriva velocidade de
+distância/tempo, então o firmware não precisa calcular nada.
+
+Separado de `telemetry_raw` porque o formato é outro. Uma leitura escalar é
+`(metric, value)`; uma posição é um par `(lat, lon)` que só significa alguma
+coisa junto. Modelar posição como duas métricas — `latitude` e `longitude` —
+ingere sem erro e **destrói o pareamento**: sem ele não há distância,
+velocidade nem ponto no mapa, porque trajetória é sequência ordenada e
+`groupBy` + `min/max/avg` é operação sobre conjunto.
+
+A Lambda de transformação rejeita coordenada fora do globo. `(0, 0)` é o fix
+de GPS inválido clássico, e deixá-lo entrar poria uma célula quente no golfo
+da Guiné.
+
 ## Basic ingest
 
 Se ninguém mais assina o tópico além da regra, publique em
@@ -232,7 +267,51 @@ sk = AGG#<granularidade>#<início do bucket>
 
 pk = CATALOG                      # uma linha por série, para a listagem
 sk = DEV#<device_id>#<metric>
+
+pk = HEAT#<device>#<dia>                 # heatmap, visão da fazenda
+sk = GH7#<geohash7>                      #   célula ~153 m
+
+pk = HEAT#<device>#<dia>#<geohash7>      # heatmap, detalhe do talhão
+sk = GH9#<geohash9>                      #   célula ~4,8 m
+
+pk = DEV#<device>#position               # última posição conhecida
+sk = LATEST
 ```
+
+### Por que geohash
+
+Geohash é **prefixo lexicográfico**: células vizinhas no espaço compartilham
+prefixo. É o mesmo truque do ISO-8601 aplicado ao mapa — `begins_with` no `sk`
+recorta uma região como `between` recorta um intervalo de tempo.
+
+E a célula grossa é a **partição** da fina. Zoom out lê a camada de 153 m
+(≈43 células por 100 ha, uma `Query`); zoom in, as células de 153 m visíveis
+são as chaves de partição da camada de 4,8 m, então o cliente pede só o que
+está na tela. Sem `Scan`, sem índice secundário.
+
+A precisão 9 não é arbitrária: implemento típico tem 6 a 12 m de largura, e a
+célula precisa ser menor que o implemento, senão sobreposição — que é o que o
+heatmap deveria denunciar — nunca aparece.
+
+### O valor da célula é tempo, não contagem
+
+Contar amostras parece natural e é enganoso: a contagem é enviesada pela taxa
+de reporte, então perda de sinal ou reporte adaptativo mentem no mapa. A
+célula guarda **segundos de permanência**, somando o `dt` entre fixes
+consecutivos, com teto em `3 × PositionSampleSeconds`. Sem o teto, um trator
+desligado às 18h e religado às 6h doaria doze horas para a célula onde
+estacionou.
+
+Distância sai do mesmo par de pontos (haversine), então velocidade =
+distância / tempo fecha sem o device informar nada.
+
+### Idempotência
+
+O item da célula acumula o dia inteiro e é sobrescrito por `(pk, sk)`. Por
+isso a etapa espacial recomputa **o dia inteiro** alcançado pelo lookback, e
+não só as últimas horas: recomputar parcialmente e sobrescrever apagaria a
+permanência acumulada antes. Custa ler ~1 dia de posições a mais por execução
+— nada, no volume de 5 s por trator.
 
 Últimas 24 h em granularidade horária:
 
@@ -258,6 +337,7 @@ HTTP API (API Gateway v2), duas rotas, cada uma com sua Lambda:
 ```
 GET /devices
 GET /devices/{device_id}/metrics/{metric}?from=<ISO>&to=<ISO>[&granularity=]
+GET /devices/{device_id}/heatmap?from=<AAAA-MM-DD>&to=<AAAA-MM-DD>[&cell=]
 ```
 
 Nenhuma das duas faz `Scan` — a policy das funções só concede
@@ -304,6 +384,12 @@ curl "$API/devices/sensor-teste/metrics/temperature\
 6 h → `1min`, até 30 d → `1h`, acima → `1d`), então o frontend só manda início
 e fim. Passe explicitamente para forçar.
 
+No heatmap, `cell` é o que troca de resolução: sem ele vêm as células de
+153 m do período; com uma célula de 153 m, vem o detalhe de 4,8 m **dentro
+dela**. A mesma célula reaparecendo em dias diferentes é somada, e `cellSize`
+volta na resposta em graus, para o cliente desenhar o retângulo sem precisar
+decodificar geohash. Teto de 31 dias por chamada.
+
 `Cache-Control` sai longo (`max-age=86400`) quando a janela pedida já fechou, e
 curto (`max-age=30`) quando alcança o presente — bucket fechado é imutável.
 Isso é o que faz um CloudFront na frente absorver a maior parte das leituras.
@@ -345,6 +431,25 @@ O gráfico mostra a faixa mín–máx atrás da linha da média. Média sozinha 
 o pico, que num gráfico de sensor costuma ser exatamente o que interessa —
 é a razão de o rollup guardar as quatro estatísticas.
 
+A aba **Mapa** desenha o heatmap de permanência. Clicar numa célula de 153 m
+entra no detalhe de 4,8 m dela; o botão na trilha volta.
+
+**Sem basemap, de propósito.** Um provedor de tiles seria dependência externa
+e, para imagem de satélite, chave paga — decisão de conta, não técnica. Para
+um talhão as próprias células já desenham o formato do campo. A projeção e o
+hit-test estão isolados em `desenhaMapa` e `celulaEm`, então uma camada de
+tiles entra por baixo depois sem mexer no resto.
+
+As cores usam rampa sequencial de um único matiz, com quebras por **quantil**
+e não lineares: a distribuição de permanência é muito assimétrica — quase toda
+célula tem poucos segundos e umas poucas concentram o trabalho — e escala
+linear pintaria o campo inteiro de uma cor só. No tema escuro a rampa inverte,
+porque quem deve recuar em direção à superfície é o valor baixo.
+
+O tile de área traz a resolução no rótulo de propósito: na célula de 153 m a
+área superestima muito, porque a célula conta inteira mesmo quando o trator só
+cruzou um canto. Só na célula fina isso vira cobertura de fato.
+
 `index.html` e `config.json` sobem com `Cache-Control: max-age=60`, então o
 CloudFront revalida depois de um deploy em vez de servir versão velha. Não há
 invalidação a rodar.
@@ -360,7 +465,17 @@ ALTER TABLE iot_telemetry_db.telemetry_raw
 
 ALTER TABLE iot_telemetry_db.telemetry_raw
   ADD PARTITION FIELD bucket(16, device_id);
+
+ALTER TABLE iot_telemetry_db.positions_raw
+  ADD PARTITION FIELD day(event_time);
+
+ALTER TABLE iot_telemetry_db.positions_raw
+  ADD PARTITION FIELD bucket(16, device_id);
 ```
+
+Na `positions_raw` isso pesa mais que na outra: a etapa espacial lê o dia
+inteiro a cada execução (ver **Idempotência** acima), então sem partição por
+dia ela varreria o histórico completo de hora em hora.
 
 Sem isso a tabela funciona, mas todo scan lê o dataset inteiro — o que
 degrada rápido conforme o histórico cresce.
@@ -372,13 +487,18 @@ degrada rápido conforme o histórico cresce.
 | `FirehoseBufferSeconds` | 300 s gera arquivos maiores e menos compaction. Baixar para 60 s reduz latência e multiplica arquivos pequenos. |
 | Mensageria IoT | Basic ingest elimina a cobrança do broker quando não há outros assinantes. |
 | Lambda de transformação | Só carimba `ingested_at`. Se o device já mandar esse campo, remova o `ProcessingConfiguration` inteiro. |
-| Glue Job | 2 workers G.1X por execução horária. Volume baixo pode virar execução de 4 em 4 h aumentando `RollupLookbackHours`. |
+| Glue Job | 2 workers G.1X por execução horária. Volume baixo pode virar execução de 4 em 4 h aumentando `RollupLookbackHours`. A etapa espacial roda no mesmo job — um segundo job dobraria o custo fixo de subida do Spark. |
+| Posições | 5 s por trator × 10 h/dia = 7,2 mil linhas/trator/dia. Dez tratores dão 26 M/ano no Iceberg, o que é pouco; o que cresce é o número de células p9 no DynamoDB. |
 | TTL do DynamoDB | `1min` expira em 7 dias, `1h` no valor de `HotStoreTtlDays`, `1d` em 8× isso. |
 
 ## O que não está aqui
 
 - **Provisionamento de devices**: certificados X.509, IoT Policy por device e
   fleet provisioning ficam numa pilha separada, com ciclo de vida próprio.
+- **Basemap no mapa**: as células são renderizadas sem imagem por baixo.
+  Tiles de satélite exigem provedor externo e, em geral, chave paga.
+- **Heatmap de frota**: hoje a partição é por trator. Um agregado por fazenda
+  seria uma partição `HEAT#FLEET#<dia>` escrita pelo mesmo job.
 - **Tabela Iceberg de agregados**: hoje o rollup vai só para o DynamoDB. Se
   quiser histórico agregado além do TTL, adicione uma segunda tabela Iceberg
   e um `MERGE INTO` no job antes da escrita no Dynamo.

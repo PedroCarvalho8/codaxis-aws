@@ -27,5 +27,8 @@ jobs:
       - name: sintaxe do python
         run: python3 -m compileall -q glue lambdas
 
+      - name: geohash do Glue Job
+        run: python3 tests/test_geohash.py
+
       - name: handlers da API
         run: python3 tests/test_api_handler.py

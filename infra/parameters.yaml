@@ -26,6 +26,23 @@
       Filtro de topico da regra do IoT Core. Para basic ingest, o device
       publica em $aws/rules/<RuleName> e este filtro passa a ser ignorado.
 
+  PositionTopicFilter:
+    Type: String
+    Default: 'devices/+/position'
+    Description: >
+      Filtro de topico da regra de posicao. Caminho separado do de telemetria
+      porque o formato do registro e outro.
+
+  PositionSampleSeconds:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 300
+    Description: >
+      Intervalo nominal entre fixes de GPS. Usado como teto do dt na conta de
+      permanencia: sem ele, um trator desligado a noite doaria horas para a
+      celula onde estacionou.
+
   RollupLookbackHours:
     Type: Number
     Default: 3

@@ -4,6 +4,12 @@
       $aws/rules/<este-nome> e pule a cobranca de mensageria do broker.
     Value: !Ref TelemetryTopicRule
 
+  PositionRuleName:
+    Description: >
+      Regra de posicao. Para basic ingest, o trator publica em
+      $aws/rules/<este-nome>.
+    Value: !Ref PositionTopicRule
+
   DeliveryStreamName:
     Value: !Ref TelemetryDeliveryStream
 

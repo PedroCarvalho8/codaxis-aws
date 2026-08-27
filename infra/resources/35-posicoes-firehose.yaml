@@ -1,0 +1,77 @@
+  # ---------------------------------------------------------------------------
+  # Caminho de ingestao das posicoes - paralelo ao da telemetria
+  #
+  # Stream separado de proposito: o caminho da telemetria ja esta em producao e
+  # nao precisa ser tocado para a posicao existir. Delivery stream parado nao
+  # custa (cobranca por GB), entao o paralelismo sai de graca.
+  # ---------------------------------------------------------------------------
+
+  PositionTransformFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-position-transform'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt TransformFunctionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          {{ include: lambdas/firehose_position_transform.py }}
+
+  PositionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/kinesisfirehose/${ProjectName}-positions'
+      RetentionInDays: 14
+
+  PositionLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref PositionLogGroup
+      LogStreamName: iceberg-delivery
+
+  PositionDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn: PositionsRawTable
+    Properties:
+      DeliveryStreamName: !Sub '${ProjectName}-positions-to-iceberg'
+      DeliveryStreamType: DirectPut
+      IcebergDestinationConfiguration:
+        RoleARN: !GetAtt FirehoseRole.Arn
+        AppendOnly: true
+        CatalogConfiguration:
+          CatalogArn: !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+        DestinationTableConfigurationList:
+          - DestinationDatabaseName: !Ref GlueDatabase
+            DestinationTableName: positions_raw
+        BufferingHints:
+          IntervalInSeconds: !Ref FirehoseBufferSeconds
+          SizeInMBs: 128
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt PositionTransformFunction.Arn
+                - ParameterName: BufferIntervalInSeconds
+                  ParameterValue: '60'
+                - ParameterName: BufferSizeInMBs
+                  ParameterValue: '3'
+        RetryOptions:
+          DurationInSeconds: 300
+        s3BackupMode: FailedDataOnly
+        S3Configuration:
+          RoleARN: !GetAtt FirehoseRole.Arn
+          BucketARN: !GetAtt DataBucket.Arn
+          Prefix: 'errors/'
+          ErrorOutputPrefix: 'errors/!{firehose:error-output-type}/'
+          BufferingHints:
+            IntervalInSeconds: 300
+            SizeInMBs: 5
+          CompressionFormat: GZIP
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref PositionLogGroup
+          LogStreamName: !Ref PositionLogStream

@@ -38,6 +38,23 @@ Parameters:
       Filtro de topico da regra do IoT Core. Para basic ingest, o device
       publica em $aws/rules/<RuleName> e este filtro passa a ser ignorado.
 
+  PositionTopicFilter:
+    Type: String
+    Default: 'devices/+/position'
+    Description: >
+      Filtro de topico da regra de posicao. Caminho separado do de telemetria
+      porque o formato do registro e outro.
+
+  PositionSampleSeconds:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 300
+    Description: >
+      Intervalo nominal entre fixes de GPS. Usado como teto do dt na conta de
+      permanencia: sem ele, um trator desligado a noite doaria horas para a
+      celula onde estacionou.
+
   RollupLookbackHours:
     Type: Number
     Default: 3
@@ -229,13 +246,93 @@ Resources:
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog'
                   - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}'
-                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/telemetry_raw'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*'
               - Effect: Allow
                 Action:
                   - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*'
+
+  # ---------------------------------------------------------------------------
+  # Posicao dos tratores - tabela Iceberg propria
+  #
+  # Nao entra em telemetry_raw porque o formato e outro: uma leitura escalar
+  # tem (metric, value); uma posicao e um par (lat, lon) que so significa
+  # alguma coisa junto. Separar em duas metricas destruiria o pareamento, e com
+  # ele distancia, velocidade e o proprio ponto no mapa.
+  # ---------------------------------------------------------------------------
+
+  PositionsRawTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      OpenTableFormatInput:
+        IcebergInput:
+          MetadataOperation: CREATE
+          Version: '2'
+      TableInput:
+        Name: positions_raw
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          format: parquet
+          write.parquet.compression-codec: zstd
+        StorageDescriptor:
+          Location: !Sub 's3://${DataBucket}/warehouse/positions_raw/'
+          Columns:
+            - Name: device_id
+              Type: string
+            - Name: event_time
+              Type: timestamp
+              Comment: Momento do fix de GPS no device (ISO-8601 UTC).
+            - Name: ingested_at
+              Type: timestamp
+            - Name: lat
+              Type: double
+            - Name: lon
+              Type: double
+            - Name: speed
+              Type: double
+              Comment: Opcional. O job deriva velocidade de distancia/tempo.
+            - Name: heading
+              Type: double
+            - Name: altitude
+              Type: double
+            - Name: batch_id
+              Type: string
+            - Name: seq
+              Type: int
+              Comment: Unico no lote inteiro, nao por campo.
+
+  PositionsCompaction:
+    Type: AWS::Glue::TableOptimizer
+    DependsOn: PositionsRawTable
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableName: positions_raw
+      Type: compaction
+      TableOptimizerConfiguration:
+        Enabled: true
+        RoleArn: !GetAtt TableOptimizerRole.Arn
+
+  PositionsSnapshotRetention:
+    Type: AWS::Glue::TableOptimizer
+    DependsOn: PositionsCompaction
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableName: positions_raw
+      Type: retention
+      TableOptimizerConfiguration:
+        Enabled: true
+        RoleArn: !GetAtt TableOptimizerRole.Arn
+        RetentionConfiguration:
+          IcebergConfiguration:
+            SnapshotRetentionPeriodInDays: 7
+            NumberOfSnapshotsToRetain: 10
+            CleanExpiredFiles: true
 
   # ---------------------------------------------------------------------------
   # Lambda de transformacao do Firehose
@@ -400,15 +497,144 @@ Resources:
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog'
                   - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}'
-                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/telemetry_raw'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*'
               - Effect: Allow
                 Action:
                   - lambda:InvokeFunction
                   - lambda:GetFunctionConfiguration
-                Resource: !GetAtt TransformFunction.Arn
+                Resource:
+                  - !GetAtt TransformFunction.Arn
+                  - !GetAtt PositionTransformFunction.Arn
               - Effect: Allow
                 Action: logs:PutLogEvents
-                Resource: !GetAtt FirehoseLogGroup.Arn
+                Resource:
+                  - !GetAtt FirehoseLogGroup.Arn
+                  - !GetAtt PositionLogGroup.Arn
+
+  # ---------------------------------------------------------------------------
+  # Caminho de ingestao das posicoes - paralelo ao da telemetria
+  #
+  # Stream separado de proposito: o caminho da telemetria ja esta em producao e
+  # nao precisa ser tocado para a posicao existir. Delivery stream parado nao
+  # custa (cobranca por GB), entao o paralelismo sai de graca.
+  # ---------------------------------------------------------------------------
+
+  PositionTransformFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-position-transform'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt TransformFunctionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import base64
+          import json
+          from datetime import datetime, timezone
+
+          # lat/lon sao obrigatorios e precisam vir PAREADOS na mesma leitura: distancia,
+          # velocidade e a propria celula do mapa dependem do par, e nenhum deles se
+          # reconstroi se os dois virarem registros separados.
+          REQUIRED = ("device_id", "event_time", "lat", "lon")
+          OPCIONAIS_FLOAT = ("speed", "heading", "altitude")
+
+
+          def handler(event, context):
+              now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+              out = []
+              for rec in event["records"]:
+                  try:
+                      payload = json.loads(base64.b64decode(rec["data"]))
+                      if any(payload.get(f) is None for f in REQUIRED):
+                          out.append({"recordId": rec["recordId"],
+                                      "result": "ProcessingFailed"})
+                          continue
+                      lat = float(payload["lat"])
+                      lon = float(payload["lon"])
+                      if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+                          # Coordenada fora do globo costuma ser fix de GPS invalido
+                          # (0,0 e o classico). Deixar entrar sujaria o heatmap com uma
+                          # celula no golfo da Guine.
+                          out.append({"recordId": rec["recordId"],
+                                      "result": "ProcessingFailed"})
+                          continue
+                      payload["lat"] = lat
+                      payload["lon"] = lon
+                      payload["ingested_at"] = now
+                      for campo in OPCIONAIS_FLOAT:
+                          if payload.get(campo) is not None:
+                              payload[campo] = float(payload[campo])
+                      if payload.get("seq") is not None:
+                          payload["seq"] = int(payload["seq"])
+                      data = base64.b64encode(
+                          json.dumps(payload).encode("utf-8")
+                      ).decode("utf-8")
+                      out.append({"recordId": rec["recordId"],
+                                  "result": "Ok",
+                                  "data": data})
+                  except Exception:
+                      out.append({"recordId": rec["recordId"],
+                                  "result": "ProcessingFailed"})
+              return {"records": out}
+
+  PositionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/kinesisfirehose/${ProjectName}-positions'
+      RetentionInDays: 14
+
+  PositionLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref PositionLogGroup
+      LogStreamName: iceberg-delivery
+
+  PositionDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn: PositionsRawTable
+    Properties:
+      DeliveryStreamName: !Sub '${ProjectName}-positions-to-iceberg'
+      DeliveryStreamType: DirectPut
+      IcebergDestinationConfiguration:
+        RoleARN: !GetAtt FirehoseRole.Arn
+        AppendOnly: true
+        CatalogConfiguration:
+          CatalogArn: !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+        DestinationTableConfigurationList:
+          - DestinationDatabaseName: !Ref GlueDatabase
+            DestinationTableName: positions_raw
+        BufferingHints:
+          IntervalInSeconds: !Ref FirehoseBufferSeconds
+          SizeInMBs: 128
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt PositionTransformFunction.Arn
+                - ParameterName: BufferIntervalInSeconds
+                  ParameterValue: '60'
+                - ParameterName: BufferSizeInMBs
+                  ParameterValue: '3'
+        RetryOptions:
+          DurationInSeconds: 300
+        s3BackupMode: FailedDataOnly
+        S3Configuration:
+          RoleARN: !GetAtt FirehoseRole.Arn
+          BucketARN: !GetAtt DataBucket.Arn
+          Prefix: 'errors/'
+          ErrorOutputPrefix: 'errors/!{firehose:error-output-type}/'
+          BufferingHints:
+            IntervalInSeconds: 300
+            SizeInMBs: 5
+          CompressionFormat: GZIP
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref PositionLogGroup
+          LogStreamName: !Ref PositionLogStream
 
   # ---------------------------------------------------------------------------
   # IoT Core - regra que joga a telemetria no Firehose
@@ -471,13 +697,49 @@ Resources:
                 Action:
                   - firehose:PutRecord
                   - firehose:PutRecordBatch
-                Resource: !GetAtt TelemetryDeliveryStream.Arn
+                Resource:
+                  - !GetAtt TelemetryDeliveryStream.Arn
+                  - !GetAtt PositionDeliveryStream.Arn
               - Effect: Allow
                 Action:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                   - logs:DescribeLogStreams
                 Resource: !GetAtt IoTRuleErrorLogGroup.Arn
+
+  # ---------------------------------------------------------------------------
+  # IoT Core - regra que joga as posicoes no Firehose
+  #
+  #   { "positions": [
+  #       {"device_id":"trator-01","event_time":"2026-08-27T14:00:00Z",
+  #        "lat":-23.5505,"lon":-46.6333,"speed":8.2,"heading":137,
+  #        "batch_id":"b-1","seq":0}, ... ] }
+  #
+  # Mesmo fan-out por BatchMode da regra de telemetria: cada elemento do array
+  # vira um registro. A 1 fix a cada 5 s, um lote por minuto tem 12 elementos,
+  # bem abaixo do teto de 500 por chamada.
+  # ---------------------------------------------------------------------------
+
+  PositionTopicRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub
+        - '${Name}_position'
+        - Name: !Join ['_', !Split ['-', !Ref ProjectName]]
+      TopicRulePayload:
+        Description: Encaminha lotes de posicao para o Firehose.
+        AwsIotSqlVersion: '2016-03-23'
+        RuleDisabled: false
+        Sql: !Sub "SELECT VALUE positions FROM '${PositionTopicFilter}'"
+        Actions:
+          - Firehose:
+              DeliveryStreamName: !Ref PositionDeliveryStream
+              RoleArn: !GetAtt IoTRuleRole.Arn
+              BatchMode: true
+        ErrorAction:
+          CloudwatchLogs:
+            LogGroupName: !Ref IoTRuleErrorLogGroup
+            RoleArn: !GetAtt IoTRuleRole.Arn
 
   # ---------------------------------------------------------------------------
   # DynamoDB - rollups servidos ao frontend
@@ -553,7 +815,9 @@ Resources:
         from awsglue.job import Job
         from awsglue.utils import getResolvedOptions
         from pyspark.context import SparkContext
+        from pyspark.sql import Window
         from pyspark.sql import functions as F
+        from pyspark.sql.types import DoubleType, StringType
 
         ARGS = getResolvedOptions(
             sys.argv,
@@ -564,12 +828,24 @@ Resources:
                 "dynamo_table",
                 "lookback_hours",
                 "ttl_days",
+                "positions_table",
+                "sample_seconds",
             ],
         )
 
         LOOKBACK_HOURS = int(ARGS["lookback_hours"])
         TTL_DAYS = int(ARGS["ttl_days"])
         DYNAMO_TABLE = ARGS["dynamo_table"]
+        SAMPLE_SECONDS = int(ARGS["sample_seconds"])
+
+        # Precisao do geohash -> (rotulo, tamanho aproximado da celula).
+        # p7 e a visao da fazenda; p9 e menor que a largura do implemento (6 a 12 m),
+        # que e a condicao para sobreposicao aparecer no mapa.
+        HEAT_GROSSA, HEAT_FINA = 7, 9
+
+        # Um ponto sem sucessor, ou com sucessor muito distante no tempo, nao pode
+        # arrastar horas de permanencia para a celula onde o trator estacionou.
+        DT_MAXIMO = SAMPLE_SECONDS * 3
 
         # granularidade -> (expressao de truncamento, formato da chave, dias de TTL)
         # TTL curto no minuto e longo no dia: o grafico de range largo nunca pede
@@ -715,6 +991,244 @@ Resources:
         else:
             print("[rollup] nenhum registro na janela; nada a fazer")
 
+
+        # =============================================================================
+        # Posicao (GPS dos tratores) -> heatmap por celula de geohash
+        #
+        # Aqui a agregacao certa nao e temporal, e espacial: quanto tempo o trator
+        # permaneceu em cada pedaco de terreno. Geohash da isso com uma propriedade
+        # util de graca -- celulas vizinhas compartilham prefixo, entao begins_with no
+        # DynamoDB recorta uma regiao do mapa como between recorta um intervalo.
+        #
+        # O valor da celula e TEMPO, nao contagem de amostras. Contagem e enviesada
+        # pela taxa de reporte: perda de sinal ou reporte adaptativo mentem no mapa.
+        # =============================================================================
+
+        BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz"
+
+
+        def geohash(lat, lon, precisao):
+            """Codifica lat/lon em geohash. Sem dependencia: o Glue nao tem pacote extra.
+
+            O prefixo e a propriedade que interessa aqui: celulas vizinhas no espaco
+            compartilham prefixo, entao begins_with no DynamoDB recorta uma regiao do
+            mapa do mesmo jeito que between recorta um intervalo de tempo.
+            """
+            lat_min, lat_max = -90.0, 90.0
+            lon_min, lon_max = -180.0, 180.0
+            codigo, bits, valor, par = [], 0, 0, True
+            while len(codigo) < precisao:
+                if par:
+                    meio = (lon_min + lon_max) / 2
+                    if lon >= meio:
+                        valor = valor * 2 + 1
+                        lon_min = meio
+                    else:
+                        valor = valor * 2
+                        lon_max = meio
+                else:
+                    meio = (lat_min + lat_max) / 2
+                    if lat >= meio:
+                        valor = valor * 2 + 1
+                        lat_min = meio
+                    else:
+                        valor = valor * 2
+                        lat_max = meio
+                par = not par
+                bits += 1
+                if bits == 5:
+                    codigo.append(BASE32[valor])
+                    bits, valor = 0, 0
+            return "".join(codigo)
+
+
+        def centro(codigo):
+            """Devolve (lat, lon) do centro da celula e o tamanho dela em graus."""
+            lat_min, lat_max = -90.0, 90.0
+            lon_min, lon_max = -180.0, 180.0
+            par = True
+            for caractere in codigo:
+                valor = BASE32.index(caractere)
+                for deslocamento in (16, 8, 4, 2, 1):
+                    bit = 1 if valor & deslocamento else 0
+                    if par:
+                        meio = (lon_min + lon_max) / 2
+                        if bit:
+                            lon_min = meio
+                        else:
+                            lon_max = meio
+                    else:
+                        meio = (lat_min + lat_max) / 2
+                        if bit:
+                            lat_min = meio
+                        else:
+                            lat_max = meio
+                    par = not par
+            return ((lat_min + lat_max) / 2, (lon_min + lon_max) / 2,
+                    lat_max - lat_min, lon_max - lon_min)
+
+
+        geohash_udf = F.udf(geohash, StringType())
+        centro_lat_udf = F.udf(lambda c: centro(c)[0], DoubleType())
+        centro_lon_udf = F.udf(lambda c: centro(c)[1], DoubleType())
+
+        # A janela de recomputacao do heatmap comeca no INICIO do dia mais antigo
+        # alcancado pelo lookback, e nao no lookback em si. Motivo: o item da celula
+        # acumula o dia inteiro e e sobrescrito por (pk, sk); recomputar so as ultimas
+        # horas e sobrescrever apagaria a permanencia acumulada antes. Recomputando o
+        # dia inteiro a escrita continua idempotente.
+        heat_inicio = (datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+
+        posicoes = (
+            spark.read.format("iceberg")
+            .load(f"glue_catalog.{ARGS['glue_database']}.{ARGS['positions_table']}")
+            .filter(F.col("event_time") >= F.lit(heat_inicio))
+            .dropDuplicates(["device_id", "batch_id", "seq"])
+        )
+
+        if posicoes.head(1):
+            ordem = Window.partitionBy("device_id").orderBy("event_time")
+
+            passo = (
+                posicoes.withColumn("prox_time", F.lead("event_time").over(ordem))
+                .withColumn("prox_lat", F.lead("lat").over(ordem))
+                .withColumn("prox_lon", F.lead("lon").over(ordem))
+                # dt do ponto ate o proximo, limitado: sem o teto, um trator desligado
+                # as 18h e religado as 6h doaria 12 h para a celula onde estacionou.
+                .withColumn(
+                    "dt",
+                    F.least(
+                        F.greatest(
+                            F.coalesce(
+                                F.unix_timestamp("prox_time") - F.unix_timestamp("event_time"),
+                                F.lit(SAMPLE_SECONDS),
+                            ),
+                            F.lit(0),
+                        ),
+                        F.lit(DT_MAXIMO),
+                    ),
+                )
+                # Haversine ate o proximo ponto. Distancia e dt saem do mesmo par, entao
+                # velocidade = distancia / tempo fecha sem o device precisar informar.
+                .withColumn(
+                    "dist_m",
+                    F.when(
+                        F.col("prox_lat").isNull(), F.lit(0.0)
+                    ).otherwise(
+                        F.lit(2 * 6371000.0)
+                        * F.asin(
+                            F.sqrt(
+                                F.pow(F.sin(F.radians(F.col("prox_lat") - F.col("lat")) / 2), 2)
+                                + F.cos(F.radians(F.col("lat")))
+                                * F.cos(F.radians(F.col("prox_lat")))
+                                * F.pow(
+                                    F.sin(F.radians(F.col("prox_lon") - F.col("lon")) / 2), 2
+                                )
+                            )
+                        )
+                    ),
+                )
+                .withColumn("dia", F.date_format("event_time", "yyyy-MM-dd"))
+                .withColumn("gh_grossa", geohash_udf("lat", "lon", F.lit(HEAT_GROSSA)))
+                .withColumn("gh_fina", geohash_udf("lat", "lon", F.lit(HEAT_FINA)))
+            )
+
+            def celulas(chaves, coluna_celula):
+                return (
+                    passo.groupBy(*chaves)
+                    .agg(
+                        F.sum("dt").alias("secs"),
+                        F.sum("dist_m").alias("dist_m"),
+                        F.count("*").alias("n"),
+                    )
+                    .withColumn("cell_lat", centro_lat_udf(F.col(coluna_celula)))
+                    .withColumn("cell_lon", centro_lon_udf(F.col(coluna_celula)))
+                )
+
+            def escreve_celulas(linhas, monta_chave, coluna_celula, prefixo_sk, expira):
+                table = boto3.resource("dynamodb").Table(DYNAMO_TABLE)
+                with table.batch_writer(overwrite_by_pkeys=["pk", "sk"]) as batch:
+                    for linha in linhas:
+                        segundos = float(linha["secs"])
+                        batch.put_item(
+                            Item={
+                                "pk": monta_chave(linha),
+                                "sk": f"{prefixo_sk}#{linha[coluna_celula]}",
+                                "gh": linha[coluna_celula],
+                                "lat": Decimal(str(round(linha["cell_lat"], 7))),
+                                "lon": Decimal(str(round(linha["cell_lon"], 7))),
+                                "secs": int(segundos),
+                                "dist_m": Decimal(str(round(float(linha["dist_m"]), 2))),
+                                "n": int(linha["n"]),
+                                "expires_at": expira,
+                            }
+                        )
+
+            expira_heat = int(
+                (datetime.now(timezone.utc) + timedelta(days=TTL_DAYS * 8)).timestamp()
+            )
+
+            # Camada grossa: poucas celulas por dia, uma Query resolve a fazenda toda.
+            grossa = celulas(["device_id", "dia", "gh_grossa"], "gh_grossa").collect()
+            escreve_celulas(
+                grossa,
+                lambda l: f"HEAT#{l['device_id']}#{l['dia']}",
+                "gh_grossa",
+                f"GH{HEAT_GROSSA}",
+                expira_heat,
+            )
+
+            # Camada fina: a celula grossa vira a particao, entao o viewport do mapa
+            # diz exatamente quais pk pedir -- sem varrer o dia inteiro na resolucao
+            # de 5 m.
+            fina = celulas(["device_id", "dia", "gh_grossa", "gh_fina"], "gh_fina")
+            total_fina = fina.count()
+            if total_fina:
+                fina.repartition(4).foreachPartition(
+                    lambda linhas: escreve_celulas(
+                        linhas,
+                        lambda l: f"HEAT#{l['device_id']}#{l['dia']}#{l['gh_grossa']}",
+                        "gh_fina",
+                        f"GH{HEAT_FINA}",
+                        expira_heat,
+                    )
+                )
+
+            # Ultima posicao conhecida: um item sobrescrito por device. E o que um mapa
+            # ao vivo precisa, e sai de graca desta passagem.
+            recentes = (
+                posicoes.withColumn(
+                    "ordem", F.row_number().over(
+                        Window.partitionBy("device_id").orderBy(F.col("event_time").desc())
+                    )
+                )
+                .filter(F.col("ordem") == 1)
+                .collect()
+            )
+            table = boto3.resource("dynamodb").Table(DYNAMO_TABLE)
+            with table.batch_writer(overwrite_by_pkeys=["pk", "sk"]) as batch:
+                for linha in recentes:
+                    batch.put_item(
+                        Item={
+                            "pk": f"DEV#{linha['device_id']}#position",
+                            "sk": "LATEST",
+                            "lat": Decimal(str(round(float(linha["lat"]), 7))),
+                            "lon": Decimal(str(round(float(linha["lon"]), 7))),
+                            "at": linha["event_time"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "expires_at": expira_heat,
+                        }
+                    )
+
+            print(
+                f"[heatmap] p{HEAT_GROSSA}: {len(grossa)} celulas | "
+                f"p{HEAT_FINA}: {total_fina} celulas | "
+                f"{len(recentes)} posicoes atuais"
+            )
+        else:
+            print("[heatmap] nenhuma posicao na janela; nada a fazer")
+
         job.commit()
   ScriptWriterFunction:
     Type: AWS::Lambda::Function
@@ -794,6 +1308,9 @@ Resources:
 
   RollupJob:
     Type: AWS::Glue::Job
+    DependsOn:
+      - TelemetryRawTable
+      - PositionsRawTable
     Properties:
       Name: !Sub '${ProjectName}-rollups'
       GlueVersion: '5.0'
@@ -817,6 +1334,8 @@ Resources:
         '--TempDir': !Sub 's3://${DataBucket}/tmp/'
         '--glue_database': !Ref GlueDatabase
         '--source_table': telemetry_raw
+        '--positions_table': positions_raw
+        '--sample_seconds': !Ref PositionSampleSeconds
         '--warehouse': !Sub 's3://${DataBucket}/warehouse/'
         '--dynamo_table': !Ref RollupTable
         '--lookback_hours': !Ref RollupLookbackHours
@@ -1167,6 +1686,157 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
 
+  # Heatmap: celulas de geohash com permanencia por celula.
+  HeatmapFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-api-heatmap'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt QueryFunctionRole.Arn
+      Timeout: 25
+      MemorySize: 512
+      Environment:
+        Variables:
+          TABLE: !Ref RollupTable
+          CORS_ORIGIN: !Ref ApiCorsOrigin
+      Code:
+        ZipFile: |
+          import json
+          import os
+
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          TABELA = boto3.resource("dynamodb").Table(os.environ["TABLE"])
+          ORIGEM = os.environ["CORS_ORIGIN"]
+          TETO = 20000
+          DIAS_MAX = 31
+
+          # Tamanho da celula em graus, derivado da precisao: p caracteres = 5p bits,
+          # repartidos entre longitude (os impares) e latitude. Vai na resposta para o
+          # cliente desenhar o retangulo sem precisar decodificar geohash.
+          def tamanho_celula(precisao):
+              bits = 5 * precisao
+              bits_lon = (bits + 1) // 2
+              bits_lat = bits // 2
+              return 180.0 / (2 ** bits_lat), 360.0 / (2 ** bits_lon)
+
+
+          def responde(status, corpo, cache="no-store"):
+              return {
+                  "statusCode": status,
+                  "headers": {
+                      "content-type": "application/json",
+                      "access-control-allow-origin": ORIGEM,
+                      "cache-control": cache,
+                  },
+                  "body": json.dumps(corpo, default=float),
+              }
+
+
+          def dias_entre(inicio, fim):
+              from datetime import date, timedelta
+              a = date.fromisoformat(inicio)
+              b = date.fromisoformat(fim)
+              if b < a:
+                  return None
+              saida, atual = [], a
+              while atual <= b and len(saida) <= DIAS_MAX:
+                  saida.append(atual.isoformat())
+                  atual += timedelta(days=1)
+              return saida
+
+
+          def handler(event, context):
+              caminho = event.get("pathParameters") or {}
+              query = event.get("queryStringParameters") or {}
+              device = caminho.get("device_id")
+
+              try:
+                  dias = dias_entre(query["from"], query["to"])
+              except (KeyError, ValueError, TypeError):
+                  return responde(400, {"erro": "from e to obrigatorios, em AAAA-MM-DD"})
+              if dias is None:
+                  return responde(400, {"erro": "to precisa ser maior ou igual a from"})
+              if len(dias) > DIAS_MAX:
+                  return responde(400, {"erro": f"intervalo maior que {DIAS_MAX} dias"})
+
+              # A celula grossa e a particao da fina: o cliente manda a celula que esta
+              # no viewport e recebe so o detalhe dela, em vez do dia inteiro a 5 m.
+              celula = query.get("cell")
+              precisao = 9 if celula else 7
+              prefixo = f"GH{precisao}"
+
+              celulas = {}
+              truncado = False
+              for dia in dias:
+                  pk = f"HEAT#{device}#{dia}" + (f"#{celula}" if celula else "")
+                  proxima = None
+                  while True:
+                      extra = {"ExclusiveStartKey": proxima} if proxima else {}
+                      pagina = TABELA.query(
+                          KeyConditionExpression=(
+                              Key("pk").eq(pk) & Key("sk").begins_with(prefixo + "#")
+                          ),
+                          **extra,
+                      )
+                      for item in pagina["Items"]:
+                          # Somar entre dias: a mesma celula reaparece a cada passagem.
+                          chave = item["gh"]
+                          acumulado = celulas.setdefault(
+                              chave,
+                              {"gh": chave, "lat": item["lat"], "lon": item["lon"],
+                               "secs": 0, "dist_m": 0, "n": 0},
+                          )
+                          acumulado["secs"] += int(item["secs"])
+                          acumulado["dist_m"] += float(item["dist_m"])
+                          acumulado["n"] += int(item["n"])
+                      proxima = pagina.get("LastEvaluatedKey")
+                      if not proxima or len(celulas) >= TETO:
+                          truncado = truncado or bool(proxima)
+                          break
+
+              d_lat, d_lon = tamanho_celula(precisao)
+              return responde(
+                  200,
+                  {
+                      "device_id": device,
+                      "precision": precisao,
+                      "cell": celula,
+                      "from": query["from"],
+                      "to": query["to"],
+                      "cellSize": {"lat": d_lat, "lon": d_lon},
+                      "truncated": truncado,
+                      "count": len(celulas),
+                      "cells": sorted(celulas.values(), key=lambda c: c["gh"]),
+                  },
+                  "public, max-age=300",
+              )
+
+  HeatmapIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RollupApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt HeatmapFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  HeatmapRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'GET /devices/{device_id}/heatmap'
+      Target: !Sub 'integrations/${HeatmapIntegration}'
+
+  HeatmapInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref HeatmapFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
+
   ApiInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -1384,6 +2054,24 @@ Resources:
           th { color: var(--tinta-mud); font-weight: 500; font-size: 11px;
                text-transform: uppercase; letter-spacing: 0.06em; }
 
+          .abas { display: flex; gap: 8px; margin: 18px 0 0; }
+          .abas button[aria-pressed="true"] { background: var(--serie); color: #fff;
+                                              border-color: var(--serie); }
+
+          .mapa-topo { display: flex; align-items: baseline; gap: 12px;
+                       flex-wrap: wrap; margin-bottom: 10px; }
+          .trilha { font-size: 13px; color: var(--tinta-2); }
+          .trilha button { padding: 2px 8px; font-size: 12px; }
+
+          #tela-mapa { display: block; width: 100%; height: auto;
+                       border-radius: 8px; cursor: crosshair; }
+
+          .escala { display: flex; align-items: center; gap: 8px; margin-top: 12px;
+                    font-size: 12px; color: var(--tinta-2); flex-wrap: wrap; }
+          .escala-faixa { display: flex; height: 10px; border-radius: 2px;
+                          overflow: hidden; min-width: 160px; }
+          .escala-faixa i { flex: 1; }
+
           .aviso { color: var(--tinta-2); padding: 28px 0; text-align: center; }
           .aviso.erro { color: var(--critico); }
           [hidden] { display: none !important; }
@@ -1399,6 +2087,12 @@ Resources:
             <button id="tema" title="Alternar tema">Tema</button>
           </header>
 
+          <div class="abas">
+            <button id="aba-serie" aria-pressed="true">Série</button>
+            <button id="aba-mapa" aria-pressed="false">Mapa</button>
+          </div>
+
+          <div id="vista-serie">
           <div class="filtros">
             <div class="campo">
               <label for="device">Dispositivo</label>
@@ -1460,6 +2154,59 @@ Resources:
                 </tr></thead>
                 <tbody id="corpo-tabela"></tbody>
               </table>
+            </div>
+          </div>
+          </div>
+
+          <div id="vista-mapa" hidden>
+            <div class="filtros">
+              <div class="campo">
+                <label for="mapa-device">Dispositivo</label>
+                <select id="mapa-device"></select>
+              </div>
+              <div class="campo">
+                <label for="mapa-de">De</label>
+                <input id="mapa-de" type="date">
+              </div>
+              <div class="campo">
+                <label for="mapa-ate">Até</label>
+                <input id="mapa-ate" type="date">
+              </div>
+              <button id="mapa-recarregar">Atualizar</button>
+            </div>
+
+            <div class="cartao">
+              <div class="mapa-topo">
+                <span class="trilha" id="trilha"></span>
+              </div>
+
+              <div class="area-grafico">
+                <canvas id="tela-mapa" role="img"
+                        aria-label="Mapa de permanência por célula"></canvas>
+                <div class="dica" id="dica-mapa"></div>
+              </div>
+
+              <div class="escala" id="escala" hidden>
+                <span>menos tempo</span>
+                <span class="escala-faixa" id="escala-faixa"></span>
+                <span>mais tempo</span>
+                <span id="escala-limites"></span>
+              </div>
+
+              <div class="tiles" id="mapa-tiles" hidden>
+                <div><div class="tile-rotulo">Tempo total</div>
+                     <div class="tile-valor" id="m-tempo">—</div></div>
+                <div><div class="tile-rotulo">Distância</div>
+                     <div class="tile-valor" id="m-dist">—</div></div>
+                <div><div class="tile-rotulo">Velocidade média</div>
+                     <div class="tile-valor" id="m-vel">—</div></div>
+                <div><div class="tile-rotulo" id="m-area-rotulo">Área</div>
+                     <div class="tile-valor" id="m-area">—</div></div>
+                <div><div class="tile-rotulo">Células</div>
+                     <div class="tile-valor" id="m-celulas">—</div></div>
+              </div>
+
+              <div id="mapa-aviso" class="aviso">Carregando…</div>
             </div>
           </div>
         </div>
@@ -1531,6 +2278,12 @@ Resources:
                             + "essa lista na primeira execução após a chegada de dados.");
                 return false;
               }
+              var mapaSel = el("mapa-device");
+              mapaSel.innerHTML = sel.innerHTML;
+              var hoje = new Date();
+              var semana = new Date(hoje.getTime() - 6 * 86400000);
+              el("mapa-ate").value = hoje.toISOString().slice(0, 10);
+              el("mapa-de").value = semana.toISOString().slice(0, 10);
               preencheMetricas();
               return true;
             });
@@ -1815,6 +2568,293 @@ Resources:
             });
           }
 
+
+          // ==========================================================================
+          // Mapa de permanencia
+          //
+          // Sem basemap de proposito: um provedor de tiles seria dependencia externa e,
+          // para imagem de satelite, chave paga. Para um talhao as celulas ja desenham
+          // o formato do campo. A projecao e o hit-test estao isolados, entao uma
+          // camada de tiles entra por baixo depois sem mexer no resto.
+          // ==========================================================================
+
+          // Rampa sequencial de um unico matiz (claro -> escuro no tema claro).
+          // No escuro ela inverte: quem tem que recuar em direcao a superficie e o
+          // valor baixo, e no fundo escuro isso e a ponta escura da rampa.
+          var RAMPA = ["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5",
+                       "#256abf", "#184f95", "#0d366b"];
+
+          var mapa = { celulas: [], tamanho: null, celulaPai: null, geometria: null };
+
+          function temaEscuro() {
+            var marcado = document.documentElement.getAttribute("data-theme");
+            return marcado ? marcado === "dark"
+                           : matchMedia("(prefers-color-scheme: dark)").matches;
+          }
+
+          function rampa() {
+            return temaEscuro() ? RAMPA.slice().reverse() : RAMPA;
+          }
+
+          function duracao(segundos) {
+            if (segundos < 60) return Math.round(segundos) + " s";
+            if (segundos < 3600) return Math.round(segundos / 60) + " min";
+            var horas = Math.floor(segundos / 3600);
+            var minutos = Math.round((segundos % 3600) / 60);
+            return horas + " h " + (minutos ? minutos + " min" : "");
+          }
+
+          function distancia(metros) {
+            return metros < 1000 ? Math.round(metros) + " m"
+                                 : (metros / 1000).toFixed(1) + " km";
+          }
+
+          function avisoMapa(texto, erro) {
+            var a = el("mapa-aviso");
+            a.textContent = texto;
+            a.className = erro ? "aviso erro" : "aviso";
+            a.hidden = false;
+            el("mapa-tiles").hidden = true;
+            el("escala").hidden = true;
+            var tela = el("tela-mapa");
+            var ctx = tela.getContext("2d");
+            ctx.clearRect(0, 0, tela.width, tela.height);
+          }
+
+          // Quebras por quantil, nao lineares: a distribuicao de permanencia e muito
+          // assimetrica -- quase toda celula tem poucos segundos e umas poucas
+          // concentram o trabalho. Escala linear pintaria o campo inteiro de uma cor.
+          function quebras(valores, faixas) {
+            var ordenado = valores.slice().sort(function (a, b) { return a - b; });
+            var saida = [];
+            for (var i = 1; i < faixas; i++) {
+              saida.push(ordenado[Math.floor(ordenado.length * i / faixas)]);
+            }
+            return saida;
+          }
+
+          function corDaCelula(segundos, cortes, cores) {
+            var i = 0;
+            while (i < cortes.length && segundos > cortes[i]) i++;
+            return cores[i];
+          }
+
+          function carregaMapa() {
+            var device = el("mapa-device").value;
+            if (!device) return;
+            var de = el("mapa-de").value, ate = el("mapa-ate").value;
+            if (!de || !ate) return;
+
+            var qs = "?from=" + de + "&to=" + ate
+                   + (mapa.celulaPai ? "&cell=" + encodeURIComponent(mapa.celulaPai) : "");
+            avisoMapa("Carregando…");
+            pegar("/devices/" + encodeURIComponent(device) + "/heatmap" + qs)
+              .then(function (dados) {
+                mapa.celulas = dados.cells || [];
+                mapa.tamanho = dados.cellSize;
+                mapa.precisao = dados.precision;
+                if (!mapa.celulas.length) {
+                  avisoMapa(mapa.celulaPai
+                    ? "Sem detalhe nessa célula no período."
+                    : "Sem posições nesse período. O Glue Job popula o mapa na "
+                      + "primeira execução depois da chegada dos dados.");
+                  atualizaTrilha();
+                  return;
+                }
+                el("mapa-aviso").hidden = true;
+                desenhaMapa();
+                preencheTilesMapa();
+                atualizaTrilha();
+              })
+              .catch(function (e) { avisoMapa(e.message, true); });
+          }
+
+          function atualizaTrilha() {
+            var t = el("trilha");
+            if (mapa.celulaPai) {
+              t.innerHTML = "";
+              t.appendChild(document.createTextNode(
+                "detalhe de " + mapa.celulaPai + " · célula ~5 m  "));
+              var voltar = document.createElement("button");
+              voltar.textContent = "voltar à visão geral";
+              voltar.addEventListener("click", function () {
+                mapa.celulaPai = null;
+                carregaMapa();
+              });
+              t.appendChild(voltar);
+            } else {
+              t.textContent = mapa.celulas.length
+                ? "visão geral · célula ~153 m · clique numa célula para o detalhe"
+                : "";
+            }
+          }
+
+          function preencheTilesMapa() {
+            var segundos = mapa.celulas.reduce(function (a, c) { return a + c.secs; }, 0);
+            var metros = mapa.celulas.reduce(function (a, c) { return a + c.dist_m; }, 0);
+            // Area da celula em m2, corrigida pela latitude.
+            var lat = mapa.celulas[0].lat;
+            var mLat = mapa.tamanho.lat * 111320;
+            var mLon = mapa.tamanho.lon * 111320 * Math.cos(lat * Math.PI / 180);
+            var area = mapa.celulas.length * mLat * mLon;
+
+            el("m-tempo").textContent = duracao(segundos);
+            el("m-dist").textContent = distancia(metros);
+            el("m-vel").textContent = segundos
+              ? (metros / segundos * 3.6).toFixed(1) + " km/h" : "—";
+            el("m-area").textContent = area > 10000
+              ? (area / 10000).toFixed(1) + " ha" : Math.round(area) + " m²";
+            // A resolucao vai no rotulo de proposito: na celula de 153 m a area
+            // superestima muito, porque a celula conta inteira mesmo quando o trator
+            // so cruzou um canto dela. So na celula fina isso vira cobertura de fato.
+            el("m-area-rotulo").textContent =
+              "Área · célula ~" + (mapa.precisao === 9 ? "5 m" : "153 m");
+            el("m-celulas").textContent = mapa.celulas.length;
+            el("mapa-tiles").hidden = false;
+          }
+
+          function desenhaMapa() {
+            var tela = el("tela-mapa");
+            var largura = tela.clientWidth || 880;
+            var altura = Math.round(Math.min(560, Math.max(320, largura * 0.62)));
+            var escala = window.devicePixelRatio || 1;
+            tela.width = largura * escala;
+            tela.height = altura * escala;
+            tela.style.height = altura + "px";
+            var ctx = tela.getContext("2d");
+            ctx.setTransform(escala, 0, 0, escala, 0, 0);
+            ctx.clearRect(0, 0, largura, altura);
+
+            var dLat = mapa.tamanho.lat, dLon = mapa.tamanho.lon;
+            var lats = mapa.celulas.map(function (c) { return c.lat; });
+            var lons = mapa.celulas.map(function (c) { return c.lon; });
+            var lat0 = Math.min.apply(null, lats) - dLat / 2;
+            var lat1 = Math.max.apply(null, lats) + dLat / 2;
+            var lon0 = Math.min.apply(null, lons) - dLon / 2;
+            var lon1 = Math.max.apply(null, lons) + dLon / 2;
+
+            // Equirretangular com correcao de cosseno: sem ela a celula sai achatada
+            // e o formato do talhao mente.
+            var k = Math.cos((lat0 + lat1) / 2 * Math.PI / 180);
+            var margem = 12;
+            var mundoL = (lon1 - lon0) * k, mundoA = lat1 - lat0;
+            var fator = Math.min((largura - 2 * margem) / mundoL,
+                                 (altura - 2 * margem) / mundoA);
+            var offX = (largura - mundoL * fator) / 2;
+            var offY = (altura - mundoA * fator) / 2;
+
+            var paraX = function (lon) { return offX + (lon - lon0) * k * fator; };
+            var paraY = function (lat) { return offY + (lat1 - lat) * fator; };
+
+            var cores = rampa();
+            var cortes = quebras(mapa.celulas.map(function (c) { return c.secs; }),
+                                 cores.length);
+
+            mapa.celulas.forEach(function (c) {
+              var x = paraX(c.lon - dLon / 2), y = paraY(c.lat + dLat / 2);
+              var l = Math.max(1, dLon * k * fator), a = Math.max(1, dLat * fator);
+              ctx.fillStyle = corDaCelula(c.secs, cortes, cores);
+              ctx.fillRect(x, y, Math.ceil(l), Math.ceil(a));
+            });
+
+            mapa.geometria = { paraX: paraX, paraY: paraY, fator: fator, k: k,
+                               lat0: lat0, lat1: lat1, lon0: lon0, dLat: dLat,
+                               dLon: dLon, offX: offX, offY: offY };
+            indexa();
+            desenhaEscala(cores, cortes);
+          }
+
+          function desenhaEscala(cores, cortes) {
+            var faixa = el("escala-faixa");
+            faixa.innerHTML = "";
+            cores.forEach(function (cor) {
+              var i = document.createElement("i");
+              i.style.background = cor;
+              faixa.appendChild(i);
+            });
+            var maximo = Math.max.apply(null, mapa.celulas.map(function (c) {
+              return c.secs;
+            }));
+            el("escala-limites").textContent =
+              "· mediana " + duracao(cortes[Math.floor(cortes.length / 2)])
+              + ", máximo " + duracao(maximo);
+            el("escala").hidden = false;
+          }
+
+          // Hit-test por aritmetica, nao por evento em cada retangulo: as celulas
+          // formam uma grade regular em lat/lon, entao da para ir da coordenada do
+          // mouse direto ao indice da celula.
+          function celulaEm(clientX, clientY) {
+            var g = mapa.geometria;
+            if (!g) return null;
+            var caixa = el("tela-mapa").getBoundingClientRect();
+            var px = clientX - caixa.left, py = clientY - caixa.top;
+            var lon = g.lon0 + (px - g.offX) / (g.k * g.fator);
+            var lat = g.lat1 - (py - g.offY) / g.fator;
+            var iLat = Math.round((lat + 90) / g.dLat - 0.5);
+            var iLon = Math.round((lon + 180) / g.dLon - 0.5);
+            return mapa.indice[iLat + "_" + iLon] || null;
+          }
+
+          function indexa() {
+            mapa.indice = {};
+            var dLat = mapa.tamanho.lat, dLon = mapa.tamanho.lon;
+            mapa.celulas.forEach(function (c) {
+              var iLat = Math.round((c.lat + 90) / dLat - 0.5);
+              var iLon = Math.round((c.lon + 180) / dLon - 0.5);
+              mapa.indice[iLat + "_" + iLon] = c;
+            });
+          }
+
+          el("tela-mapa").addEventListener("mousemove", function (evento) {
+            var dica = el("dica-mapa");
+            var c = celulaEm(evento.clientX, evento.clientY);
+            if (!c) { dica.style.opacity = 0; return; }
+            var vel = c.secs ? (c.dist_m / c.secs * 3.6).toFixed(1) + " km/h" : "—";
+            dica.innerHTML = "<b>" + c.gh + "</b><dl>"
+              + "<dt>permanência</dt><dd>" + duracao(c.secs) + "</dd>"
+              + "<dt>distância</dt><dd>" + distancia(c.dist_m) + "</dd>"
+              + "<dt>velocidade</dt><dd>" + vel + "</dd>"
+              + "<dt>fixes</dt><dd>" + c.n + "</dd></dl>";
+            dica.style.opacity = 1;
+            var caixa = el("tela-mapa").getBoundingClientRect();
+            var esquerda = evento.clientX - caixa.left + 14;
+            if (esquerda + dica.offsetWidth > caixa.width) {
+              esquerda = evento.clientX - caixa.left - dica.offsetWidth - 14;
+            }
+            dica.style.left = Math.max(0, esquerda) + "px";
+            dica.style.top = Math.max(0, evento.clientY - caixa.top - 10) + "px";
+          });
+
+          el("tela-mapa").addEventListener("mouseleave", function () {
+            el("dica-mapa").style.opacity = 0;
+          });
+
+          el("tela-mapa").addEventListener("click", function (evento) {
+            if (mapa.celulaPai) return;             // ja esta no detalhe
+            var c = celulaEm(evento.clientX, evento.clientY);
+            if (!c) return;
+            mapa.celulaPai = c.gh;
+            carregaMapa();
+          });
+
+          function trocaVista(paraMapa) {
+            el("vista-serie").hidden = paraMapa;
+            el("vista-mapa").hidden = !paraMapa;
+            el("aba-serie").setAttribute("aria-pressed", String(!paraMapa));
+            el("aba-mapa").setAttribute("aria-pressed", String(paraMapa));
+            if (paraMapa && !mapa.celulas.length) carregaMapa();
+          }
+
+          el("aba-serie").addEventListener("click", function () { trocaVista(false); });
+          el("aba-mapa").addEventListener("click", function () { trocaVista(true); });
+          el("mapa-device").addEventListener("change", function () {
+            mapa.celulaPai = null; carregaMapa();
+          });
+          el("mapa-de").addEventListener("change", carregaMapa);
+          el("mapa-ate").addEventListener("change", carregaMapa);
+          el("mapa-recarregar").addEventListener("click", carregaMapa);
+
           // ---------------------------------------------------------------- eventos
           el("device").addEventListener("change", function () {
             preencheMetricas(); carregaSerie();
@@ -1837,9 +2877,13 @@ Resources:
               : matchMedia("(prefers-color-scheme: dark)").matches;
             document.documentElement.setAttribute("data-theme", escuro ? "light" : "dark");
             if (serie.length) desenha();
+            if (mapa.celulas.length) desenhaMapa();
           });
 
-          window.addEventListener("resize", function () { if (serie.length) desenha(); });
+          window.addEventListener("resize", function () {
+            if (serie.length) desenha();
+            if (mapa.celulas.length && !el("vista-mapa").hidden) desenhaMapa();
+          });
 
           // ----------------------------------------------------------------- início
           fetch("config.json")
@@ -1874,6 +2918,12 @@ Outputs:
       Nome da regra. Para basic ingest, publique em
       $aws/rules/<este-nome> e pule a cobranca de mensageria do broker.
     Value: !Ref TelemetryTopicRule
+
+  PositionRuleName:
+    Description: >
+      Regra de posicao. Para basic ingest, o trator publica em
+      $aws/rules/<este-nome>.
+    Value: !Ref PositionTopicRule
 
   DeliveryStreamName:
     Value: !Ref TelemetryDeliveryStream

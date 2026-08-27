@@ -132,12 +132,16 @@
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog'
                   - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}'
-                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/telemetry_raw'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*'
               - Effect: Allow
                 Action:
                   - lambda:InvokeFunction
                   - lambda:GetFunctionConfiguration
-                Resource: !GetAtt TransformFunction.Arn
+                Resource:
+                  - !GetAtt TransformFunction.Arn
+                  - !GetAtt PositionTransformFunction.Arn
               - Effect: Allow
                 Action: logs:PutLogEvents
-                Resource: !GetAtt FirehoseLogGroup.Arn
+                Resource:
+                  - !GetAtt FirehoseLogGroup.Arn
+                  - !GetAtt PositionLogGroup.Arn

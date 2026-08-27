@@ -59,7 +59,9 @@
                 Action:
                   - firehose:PutRecord
                   - firehose:PutRecordBatch
-                Resource: !GetAtt TelemetryDeliveryStream.Arn
+                Resource:
+                  - !GetAtt TelemetryDeliveryStream.Arn
+                  - !GetAtt PositionDeliveryStream.Arn
               - Effect: Allow
                 Action:
                   - logs:CreateLogStream

@@ -60,11 +60,39 @@ CATALOGO = [
 ]
 
 
+# Uma celula que reaparece em dois dias (o trator passou de novo no mesmo
+# lugar) e outra que so aparece num deles.
+HEAT = {
+    "HEAT#trator-01#2026-08-26": [
+        {"gh": "6gyf4bf", "lat": Decimal("-23.55"), "lon": Decimal("-46.63"),
+         "secs": 120, "dist_m": Decimal("300.5"), "n": 24},
+        {"gh": "6gyf4bg", "lat": Decimal("-23.56"), "lon": Decimal("-46.64"),
+         "secs": 45, "dist_m": Decimal("110.0"), "n": 9},
+    ],
+    "HEAT#trator-01#2026-08-27": [
+        {"gh": "6gyf4bf", "lat": Decimal("-23.55"), "lon": Decimal("-46.63"),
+         "secs": 80, "dist_m": Decimal("200.0"), "n": 16},
+    ],
+    "HEAT#trator-01#2026-08-27#6gyf4bf": [
+        {"gh": "6gyf4bf8m", "lat": Decimal("-23.5505"), "lon": Decimal("-46.6333"),
+         "secs": 35, "dist_m": Decimal("12.5"), "n": 7},
+    ],
+}
+
+
 class TabelaFake:
     def query(self, KeyConditionExpression, **kwargs):
         literais = achata(KeyConditionExpression)
         capturado["chaves"] = literais
         capturado["sk"] = [v for v in literais if v.startswith("AGG#")]
+        capturado.setdefault("pks_heat", [])
+        alvo = next((v for v in literais if v.startswith("HEAT#")), None)
+        if alvo:
+            capturado["pks_heat"].append(alvo)
+            capturado["prefixo_sk"] = next(
+                (v for v in literais if v.startswith("GH")), None
+            )
+            return {"Items": [dict(i) for i in HEAT.get(alvo, [])]}
         if "CATALOG" in literais:
             return {"Items": list(CATALOGO)}
         return {
@@ -102,6 +130,7 @@ def carrega_handler(recurso):
 
 handler = carrega_handler("QueryFunction").handler
 handler_catalogo = carrega_handler("CatalogFunction").handler
+handler_heatmap = carrega_handler("HeatmapFunction").handler
 falhas = []
 
 
@@ -171,6 +200,47 @@ checa("catalogo: unidade preservada",
       catalogo["devices"][0]["metrics"][1]["unit"], "C")
 checa("catalogo: cache curto",
       handler_catalogo({}, None)["headers"]["cache-control"], "public, max-age=60")
+
+# ----------------------------------------------------------------- heatmap
+def chama_heat(query, device="trator-01"):
+    capturado["pks_heat"] = []
+    return handler_heatmap(
+        {"pathParameters": {"device_id": device}, "queryStringParameters": query},
+        None,
+    )
+
+
+checa("heat: sem from/to -> 400", chama_heat({})["statusCode"], 400)
+checa("heat: to < from -> 400",
+      chama_heat({"from": "2026-08-27", "to": "2026-08-26"})["statusCode"], 400)
+checa("heat: data invalida -> 400",
+      chama_heat({"from": "27/08/2026", "to": "27/08/2026"})["statusCode"], 400)
+checa("heat: intervalo longo demais -> 400",
+      chama_heat({"from": "2026-01-01", "to": "2026-06-01"})["statusCode"], 400)
+
+grossa = json.loads(chama_heat({"from": "2026-08-26", "to": "2026-08-27"})["body"])
+checa("heat: uma Query por dia", capturado["pks_heat"],
+      ["HEAT#trator-01#2026-08-26", "HEAT#trator-01#2026-08-27"])
+checa("heat: precisao grossa por padrao", grossa["precision"], 7)
+checa("heat: prefixo de sk", capturado["prefixo_sk"], "GH7#")
+checa("heat: celulas distintas", grossa["count"], 2)
+# 120 s no dia 26 + 80 s no dia 27 na mesma celula
+checa("heat: permanencia somada entre dias",
+      [c["secs"] for c in grossa["cells"]], [200, 45])
+checa("heat: distancia somada entre dias",
+      round(grossa["cells"][0]["dist_m"], 1), 500.5)
+checa("heat: amostras somadas", grossa["cells"][0]["n"], 40)
+checa("heat: cellSize p7", round(grossa["cellSize"]["lat"], 9), 0.001373291)
+
+fina = json.loads(
+    chama_heat({"from": "2026-08-27", "to": "2026-08-27", "cell": "6gyf4bf"})["body"]
+)
+checa("heat: cell muda a precisao", fina["precision"], 9)
+checa("heat: cell entra na particao", capturado["pks_heat"],
+      ["HEAT#trator-01#2026-08-27#6gyf4bf"])
+checa("heat: prefixo de sk fino", capturado["prefixo_sk"], "GH9#")
+checa("heat: celula fina devolvida", fina["cells"][0]["gh"], "6gyf4bf8m")
+checa("heat: cellSize p9", round(fina["cellSize"]["lat"], 11), 4.291534e-05)
 
 print("\n=> todos os casos passaram" if not falhas else f"\n=> {len(falhas)} FALHA(S)")
 sys.exit(1 if falhas else 0)

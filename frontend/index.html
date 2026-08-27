@@ -121,6 +121,24 @@
   th { color: var(--tinta-mud); font-weight: 500; font-size: 11px;
        text-transform: uppercase; letter-spacing: 0.06em; }
 
+  .abas { display: flex; gap: 8px; margin: 18px 0 0; }
+  .abas button[aria-pressed="true"] { background: var(--serie); color: #fff;
+                                      border-color: var(--serie); }
+
+  .mapa-topo { display: flex; align-items: baseline; gap: 12px;
+               flex-wrap: wrap; margin-bottom: 10px; }
+  .trilha { font-size: 13px; color: var(--tinta-2); }
+  .trilha button { padding: 2px 8px; font-size: 12px; }
+
+  #tela-mapa { display: block; width: 100%; height: auto;
+               border-radius: 8px; cursor: crosshair; }
+
+  .escala { display: flex; align-items: center; gap: 8px; margin-top: 12px;
+            font-size: 12px; color: var(--tinta-2); flex-wrap: wrap; }
+  .escala-faixa { display: flex; height: 10px; border-radius: 2px;
+                  overflow: hidden; min-width: 160px; }
+  .escala-faixa i { flex: 1; }
+
   .aviso { color: var(--tinta-2); padding: 28px 0; text-align: center; }
   .aviso.erro { color: var(--critico); }
   [hidden] { display: none !important; }
@@ -136,6 +154,12 @@
     <button id="tema" title="Alternar tema">Tema</button>
   </header>
 
+  <div class="abas">
+    <button id="aba-serie" aria-pressed="true">Série</button>
+    <button id="aba-mapa" aria-pressed="false">Mapa</button>
+  </div>
+
+  <div id="vista-serie">
   <div class="filtros">
     <div class="campo">
       <label for="device">Dispositivo</label>
@@ -197,6 +221,59 @@
         </tr></thead>
         <tbody id="corpo-tabela"></tbody>
       </table>
+    </div>
+  </div>
+  </div>
+
+  <div id="vista-mapa" hidden>
+    <div class="filtros">
+      <div class="campo">
+        <label for="mapa-device">Dispositivo</label>
+        <select id="mapa-device"></select>
+      </div>
+      <div class="campo">
+        <label for="mapa-de">De</label>
+        <input id="mapa-de" type="date">
+      </div>
+      <div class="campo">
+        <label for="mapa-ate">Até</label>
+        <input id="mapa-ate" type="date">
+      </div>
+      <button id="mapa-recarregar">Atualizar</button>
+    </div>
+
+    <div class="cartao">
+      <div class="mapa-topo">
+        <span class="trilha" id="trilha"></span>
+      </div>
+
+      <div class="area-grafico">
+        <canvas id="tela-mapa" role="img"
+                aria-label="Mapa de permanência por célula"></canvas>
+        <div class="dica" id="dica-mapa"></div>
+      </div>
+
+      <div class="escala" id="escala" hidden>
+        <span>menos tempo</span>
+        <span class="escala-faixa" id="escala-faixa"></span>
+        <span>mais tempo</span>
+        <span id="escala-limites"></span>
+      </div>
+
+      <div class="tiles" id="mapa-tiles" hidden>
+        <div><div class="tile-rotulo">Tempo total</div>
+             <div class="tile-valor" id="m-tempo">—</div></div>
+        <div><div class="tile-rotulo">Distância</div>
+             <div class="tile-valor" id="m-dist">—</div></div>
+        <div><div class="tile-rotulo">Velocidade média</div>
+             <div class="tile-valor" id="m-vel">—</div></div>
+        <div><div class="tile-rotulo" id="m-area-rotulo">Área</div>
+             <div class="tile-valor" id="m-area">—</div></div>
+        <div><div class="tile-rotulo">Células</div>
+             <div class="tile-valor" id="m-celulas">—</div></div>
+      </div>
+
+      <div id="mapa-aviso" class="aviso">Carregando…</div>
     </div>
   </div>
 </div>
@@ -268,6 +345,12 @@
                     + "essa lista na primeira execução após a chegada de dados.");
         return false;
       }
+      var mapaSel = el("mapa-device");
+      mapaSel.innerHTML = sel.innerHTML;
+      var hoje = new Date();
+      var semana = new Date(hoje.getTime() - 6 * 86400000);
+      el("mapa-ate").value = hoje.toISOString().slice(0, 10);
+      el("mapa-de").value = semana.toISOString().slice(0, 10);
       preencheMetricas();
       return true;
     });
@@ -552,6 +635,293 @@
     });
   }
 
+
+  // ==========================================================================
+  // Mapa de permanencia
+  //
+  // Sem basemap de proposito: um provedor de tiles seria dependencia externa e,
+  // para imagem de satelite, chave paga. Para um talhao as celulas ja desenham
+  // o formato do campo. A projecao e o hit-test estao isolados, entao uma
+  // camada de tiles entra por baixo depois sem mexer no resto.
+  // ==========================================================================
+
+  // Rampa sequencial de um unico matiz (claro -> escuro no tema claro).
+  // No escuro ela inverte: quem tem que recuar em direcao a superficie e o
+  // valor baixo, e no fundo escuro isso e a ponta escura da rampa.
+  var RAMPA = ["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5",
+               "#256abf", "#184f95", "#0d366b"];
+
+  var mapa = { celulas: [], tamanho: null, celulaPai: null, geometria: null };
+
+  function temaEscuro() {
+    var marcado = document.documentElement.getAttribute("data-theme");
+    return marcado ? marcado === "dark"
+                   : matchMedia("(prefers-color-scheme: dark)").matches;
+  }
+
+  function rampa() {
+    return temaEscuro() ? RAMPA.slice().reverse() : RAMPA;
+  }
+
+  function duracao(segundos) {
+    if (segundos < 60) return Math.round(segundos) + " s";
+    if (segundos < 3600) return Math.round(segundos / 60) + " min";
+    var horas = Math.floor(segundos / 3600);
+    var minutos = Math.round((segundos % 3600) / 60);
+    return horas + " h " + (minutos ? minutos + " min" : "");
+  }
+
+  function distancia(metros) {
+    return metros < 1000 ? Math.round(metros) + " m"
+                         : (metros / 1000).toFixed(1) + " km";
+  }
+
+  function avisoMapa(texto, erro) {
+    var a = el("mapa-aviso");
+    a.textContent = texto;
+    a.className = erro ? "aviso erro" : "aviso";
+    a.hidden = false;
+    el("mapa-tiles").hidden = true;
+    el("escala").hidden = true;
+    var tela = el("tela-mapa");
+    var ctx = tela.getContext("2d");
+    ctx.clearRect(0, 0, tela.width, tela.height);
+  }
+
+  // Quebras por quantil, nao lineares: a distribuicao de permanencia e muito
+  // assimetrica -- quase toda celula tem poucos segundos e umas poucas
+  // concentram o trabalho. Escala linear pintaria o campo inteiro de uma cor.
+  function quebras(valores, faixas) {
+    var ordenado = valores.slice().sort(function (a, b) { return a - b; });
+    var saida = [];
+    for (var i = 1; i < faixas; i++) {
+      saida.push(ordenado[Math.floor(ordenado.length * i / faixas)]);
+    }
+    return saida;
+  }
+
+  function corDaCelula(segundos, cortes, cores) {
+    var i = 0;
+    while (i < cortes.length && segundos > cortes[i]) i++;
+    return cores[i];
+  }
+
+  function carregaMapa() {
+    var device = el("mapa-device").value;
+    if (!device) return;
+    var de = el("mapa-de").value, ate = el("mapa-ate").value;
+    if (!de || !ate) return;
+
+    var qs = "?from=" + de + "&to=" + ate
+           + (mapa.celulaPai ? "&cell=" + encodeURIComponent(mapa.celulaPai) : "");
+    avisoMapa("Carregando…");
+    pegar("/devices/" + encodeURIComponent(device) + "/heatmap" + qs)
+      .then(function (dados) {
+        mapa.celulas = dados.cells || [];
+        mapa.tamanho = dados.cellSize;
+        mapa.precisao = dados.precision;
+        if (!mapa.celulas.length) {
+          avisoMapa(mapa.celulaPai
+            ? "Sem detalhe nessa célula no período."
+            : "Sem posições nesse período. O Glue Job popula o mapa na "
+              + "primeira execução depois da chegada dos dados.");
+          atualizaTrilha();
+          return;
+        }
+        el("mapa-aviso").hidden = true;
+        desenhaMapa();
+        preencheTilesMapa();
+        atualizaTrilha();
+      })
+      .catch(function (e) { avisoMapa(e.message, true); });
+  }
+
+  function atualizaTrilha() {
+    var t = el("trilha");
+    if (mapa.celulaPai) {
+      t.innerHTML = "";
+      t.appendChild(document.createTextNode(
+        "detalhe de " + mapa.celulaPai + " · célula ~5 m  "));
+      var voltar = document.createElement("button");
+      voltar.textContent = "voltar à visão geral";
+      voltar.addEventListener("click", function () {
+        mapa.celulaPai = null;
+        carregaMapa();
+      });
+      t.appendChild(voltar);
+    } else {
+      t.textContent = mapa.celulas.length
+        ? "visão geral · célula ~153 m · clique numa célula para o detalhe"
+        : "";
+    }
+  }
+
+  function preencheTilesMapa() {
+    var segundos = mapa.celulas.reduce(function (a, c) { return a + c.secs; }, 0);
+    var metros = mapa.celulas.reduce(function (a, c) { return a + c.dist_m; }, 0);
+    // Area da celula em m2, corrigida pela latitude.
+    var lat = mapa.celulas[0].lat;
+    var mLat = mapa.tamanho.lat * 111320;
+    var mLon = mapa.tamanho.lon * 111320 * Math.cos(lat * Math.PI / 180);
+    var area = mapa.celulas.length * mLat * mLon;
+
+    el("m-tempo").textContent = duracao(segundos);
+    el("m-dist").textContent = distancia(metros);
+    el("m-vel").textContent = segundos
+      ? (metros / segundos * 3.6).toFixed(1) + " km/h" : "—";
+    el("m-area").textContent = area > 10000
+      ? (area / 10000).toFixed(1) + " ha" : Math.round(area) + " m²";
+    // A resolucao vai no rotulo de proposito: na celula de 153 m a area
+    // superestima muito, porque a celula conta inteira mesmo quando o trator
+    // so cruzou um canto dela. So na celula fina isso vira cobertura de fato.
+    el("m-area-rotulo").textContent =
+      "Área · célula ~" + (mapa.precisao === 9 ? "5 m" : "153 m");
+    el("m-celulas").textContent = mapa.celulas.length;
+    el("mapa-tiles").hidden = false;
+  }
+
+  function desenhaMapa() {
+    var tela = el("tela-mapa");
+    var largura = tela.clientWidth || 880;
+    var altura = Math.round(Math.min(560, Math.max(320, largura * 0.62)));
+    var escala = window.devicePixelRatio || 1;
+    tela.width = largura * escala;
+    tela.height = altura * escala;
+    tela.style.height = altura + "px";
+    var ctx = tela.getContext("2d");
+    ctx.setTransform(escala, 0, 0, escala, 0, 0);
+    ctx.clearRect(0, 0, largura, altura);
+
+    var dLat = mapa.tamanho.lat, dLon = mapa.tamanho.lon;
+    var lats = mapa.celulas.map(function (c) { return c.lat; });
+    var lons = mapa.celulas.map(function (c) { return c.lon; });
+    var lat0 = Math.min.apply(null, lats) - dLat / 2;
+    var lat1 = Math.max.apply(null, lats) + dLat / 2;
+    var lon0 = Math.min.apply(null, lons) - dLon / 2;
+    var lon1 = Math.max.apply(null, lons) + dLon / 2;
+
+    // Equirretangular com correcao de cosseno: sem ela a celula sai achatada
+    // e o formato do talhao mente.
+    var k = Math.cos((lat0 + lat1) / 2 * Math.PI / 180);
+    var margem = 12;
+    var mundoL = (lon1 - lon0) * k, mundoA = lat1 - lat0;
+    var fator = Math.min((largura - 2 * margem) / mundoL,
+                         (altura - 2 * margem) / mundoA);
+    var offX = (largura - mundoL * fator) / 2;
+    var offY = (altura - mundoA * fator) / 2;
+
+    var paraX = function (lon) { return offX + (lon - lon0) * k * fator; };
+    var paraY = function (lat) { return offY + (lat1 - lat) * fator; };
+
+    var cores = rampa();
+    var cortes = quebras(mapa.celulas.map(function (c) { return c.secs; }),
+                         cores.length);
+
+    mapa.celulas.forEach(function (c) {
+      var x = paraX(c.lon - dLon / 2), y = paraY(c.lat + dLat / 2);
+      var l = Math.max(1, dLon * k * fator), a = Math.max(1, dLat * fator);
+      ctx.fillStyle = corDaCelula(c.secs, cortes, cores);
+      ctx.fillRect(x, y, Math.ceil(l), Math.ceil(a));
+    });
+
+    mapa.geometria = { paraX: paraX, paraY: paraY, fator: fator, k: k,
+                       lat0: lat0, lat1: lat1, lon0: lon0, dLat: dLat,
+                       dLon: dLon, offX: offX, offY: offY };
+    indexa();
+    desenhaEscala(cores, cortes);
+  }
+
+  function desenhaEscala(cores, cortes) {
+    var faixa = el("escala-faixa");
+    faixa.innerHTML = "";
+    cores.forEach(function (cor) {
+      var i = document.createElement("i");
+      i.style.background = cor;
+      faixa.appendChild(i);
+    });
+    var maximo = Math.max.apply(null, mapa.celulas.map(function (c) {
+      return c.secs;
+    }));
+    el("escala-limites").textContent =
+      "· mediana " + duracao(cortes[Math.floor(cortes.length / 2)])
+      + ", máximo " + duracao(maximo);
+    el("escala").hidden = false;
+  }
+
+  // Hit-test por aritmetica, nao por evento em cada retangulo: as celulas
+  // formam uma grade regular em lat/lon, entao da para ir da coordenada do
+  // mouse direto ao indice da celula.
+  function celulaEm(clientX, clientY) {
+    var g = mapa.geometria;
+    if (!g) return null;
+    var caixa = el("tela-mapa").getBoundingClientRect();
+    var px = clientX - caixa.left, py = clientY - caixa.top;
+    var lon = g.lon0 + (px - g.offX) / (g.k * g.fator);
+    var lat = g.lat1 - (py - g.offY) / g.fator;
+    var iLat = Math.round((lat + 90) / g.dLat - 0.5);
+    var iLon = Math.round((lon + 180) / g.dLon - 0.5);
+    return mapa.indice[iLat + "_" + iLon] || null;
+  }
+
+  function indexa() {
+    mapa.indice = {};
+    var dLat = mapa.tamanho.lat, dLon = mapa.tamanho.lon;
+    mapa.celulas.forEach(function (c) {
+      var iLat = Math.round((c.lat + 90) / dLat - 0.5);
+      var iLon = Math.round((c.lon + 180) / dLon - 0.5);
+      mapa.indice[iLat + "_" + iLon] = c;
+    });
+  }
+
+  el("tela-mapa").addEventListener("mousemove", function (evento) {
+    var dica = el("dica-mapa");
+    var c = celulaEm(evento.clientX, evento.clientY);
+    if (!c) { dica.style.opacity = 0; return; }
+    var vel = c.secs ? (c.dist_m / c.secs * 3.6).toFixed(1) + " km/h" : "—";
+    dica.innerHTML = "<b>" + c.gh + "</b><dl>"
+      + "<dt>permanência</dt><dd>" + duracao(c.secs) + "</dd>"
+      + "<dt>distância</dt><dd>" + distancia(c.dist_m) + "</dd>"
+      + "<dt>velocidade</dt><dd>" + vel + "</dd>"
+      + "<dt>fixes</dt><dd>" + c.n + "</dd></dl>";
+    dica.style.opacity = 1;
+    var caixa = el("tela-mapa").getBoundingClientRect();
+    var esquerda = evento.clientX - caixa.left + 14;
+    if (esquerda + dica.offsetWidth > caixa.width) {
+      esquerda = evento.clientX - caixa.left - dica.offsetWidth - 14;
+    }
+    dica.style.left = Math.max(0, esquerda) + "px";
+    dica.style.top = Math.max(0, evento.clientY - caixa.top - 10) + "px";
+  });
+
+  el("tela-mapa").addEventListener("mouseleave", function () {
+    el("dica-mapa").style.opacity = 0;
+  });
+
+  el("tela-mapa").addEventListener("click", function (evento) {
+    if (mapa.celulaPai) return;             // ja esta no detalhe
+    var c = celulaEm(evento.clientX, evento.clientY);
+    if (!c) return;
+    mapa.celulaPai = c.gh;
+    carregaMapa();
+  });
+
+  function trocaVista(paraMapa) {
+    el("vista-serie").hidden = paraMapa;
+    el("vista-mapa").hidden = !paraMapa;
+    el("aba-serie").setAttribute("aria-pressed", String(!paraMapa));
+    el("aba-mapa").setAttribute("aria-pressed", String(paraMapa));
+    if (paraMapa && !mapa.celulas.length) carregaMapa();
+  }
+
+  el("aba-serie").addEventListener("click", function () { trocaVista(false); });
+  el("aba-mapa").addEventListener("click", function () { trocaVista(true); });
+  el("mapa-device").addEventListener("change", function () {
+    mapa.celulaPai = null; carregaMapa();
+  });
+  el("mapa-de").addEventListener("change", carregaMapa);
+  el("mapa-ate").addEventListener("change", carregaMapa);
+  el("mapa-recarregar").addEventListener("click", carregaMapa);
+
   // ---------------------------------------------------------------- eventos
   el("device").addEventListener("change", function () {
     preencheMetricas(); carregaSerie();
@@ -574,9 +944,13 @@
       : matchMedia("(prefers-color-scheme: dark)").matches;
     document.documentElement.setAttribute("data-theme", escuro ? "light" : "dark");
     if (serie.length) desenha();
+    if (mapa.celulas.length) desenhaMapa();
   });
 
-  window.addEventListener("resize", function () { if (serie.length) desenha(); });
+  window.addEventListener("resize", function () {
+    if (serie.length) desenha();
+    if (mapa.celulas.length && !el("vista-mapa").hidden) desenhaMapa();
+  });
 
   // ----------------------------------------------------------------- início
   fetch("config.json")

@@ -62,6 +62,9 @@
 
   RollupJob:
     Type: AWS::Glue::Job
+    DependsOn:
+      - TelemetryRawTable
+      - PositionsRawTable
     Properties:
       Name: !Sub '${ProjectName}-rollups'
       GlueVersion: '5.0'
@@ -85,6 +88,8 @@
         '--TempDir': !Sub 's3://${DataBucket}/tmp/'
         '--glue_database': !Ref GlueDatabase
         '--source_table': telemetry_raw
+        '--positions_table': positions_raw
+        '--sample_seconds': !Ref PositionSampleSeconds
         '--warehouse': !Sub 's3://${DataBucket}/warehouse/'
         '--dynamo_table': !Ref RollupTable
         '--lookback_hours': !Ref RollupLookbackHours

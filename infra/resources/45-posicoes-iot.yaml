@@ -1,0 +1,33 @@
+  # ---------------------------------------------------------------------------
+  # IoT Core - regra que joga as posicoes no Firehose
+  #
+  #   { "positions": [
+  #       {"device_id":"trator-01","event_time":"2026-08-27T14:00:00Z",
+  #        "lat":-23.5505,"lon":-46.6333,"speed":8.2,"heading":137,
+  #        "batch_id":"b-1","seq":0}, ... ] }
+  #
+  # Mesmo fan-out por BatchMode da regra de telemetria: cada elemento do array
+  # vira um registro. A 1 fix a cada 5 s, um lote por minuto tem 12 elementos,
+  # bem abaixo do teto de 500 por chamada.
+  # ---------------------------------------------------------------------------
+
+  PositionTopicRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub
+        - '${Name}_position'
+        - Name: !Join ['_', !Split ['-', !Ref ProjectName]]
+      TopicRulePayload:
+        Description: Encaminha lotes de posicao para o Firehose.
+        AwsIotSqlVersion: '2016-03-23'
+        RuleDisabled: false
+        Sql: !Sub "SELECT VALUE positions FROM '${PositionTopicFilter}'"
+        Actions:
+          - Firehose:
+              DeliveryStreamName: !Ref PositionDeliveryStream
+              RoleArn: !GetAtt IoTRuleRole.Arn
+              BatchMode: true
+        ErrorAction:
+          CloudwatchLogs:
+            LogGroupName: !Ref IoTRuleErrorLogGroup
+            RoleArn: !GetAtt IoTRuleRole.Arn

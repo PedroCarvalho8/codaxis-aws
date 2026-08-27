@@ -139,6 +139,47 @@
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
 
+  # Heatmap: celulas de geohash com permanencia por celula.
+  HeatmapFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-api-heatmap'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt QueryFunctionRole.Arn
+      Timeout: 25
+      MemorySize: 512
+      Environment:
+        Variables:
+          TABLE: !Ref RollupTable
+          CORS_ORIGIN: !Ref ApiCorsOrigin
+      Code:
+        ZipFile: |
+          {{ include: lambdas/api_heatmap.py }}
+
+  HeatmapIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RollupApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt HeatmapFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  HeatmapRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'GET /devices/{device_id}/heatmap'
+      Target: !Sub 'integrations/${HeatmapIntegration}'
+
+  HeatmapInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref HeatmapFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
+
   ApiInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:

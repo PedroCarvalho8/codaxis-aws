@@ -19,7 +19,9 @@ from awsglue.context import GlueContext
 from awsglue.job import Job
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
+from pyspark.sql import Window
 from pyspark.sql import functions as F
+from pyspark.sql.types import DoubleType, StringType
 
 ARGS = getResolvedOptions(
     sys.argv,
@@ -30,12 +32,24 @@ ARGS = getResolvedOptions(
         "dynamo_table",
         "lookback_hours",
         "ttl_days",
+        "positions_table",
+        "sample_seconds",
     ],
 )
 
 LOOKBACK_HOURS = int(ARGS["lookback_hours"])
 TTL_DAYS = int(ARGS["ttl_days"])
 DYNAMO_TABLE = ARGS["dynamo_table"]
+SAMPLE_SECONDS = int(ARGS["sample_seconds"])
+
+# Precisao do geohash -> (rotulo, tamanho aproximado da celula).
+# p7 e a visao da fazenda; p9 e menor que a largura do implemento (6 a 12 m),
+# que e a condicao para sobreposicao aparecer no mapa.
+HEAT_GROSSA, HEAT_FINA = 7, 9
+
+# Um ponto sem sucessor, ou com sucessor muito distante no tempo, nao pode
+# arrastar horas de permanencia para a celula onde o trator estacionou.
+DT_MAXIMO = SAMPLE_SECONDS * 3
 
 # granularidade -> (expressao de truncamento, formato da chave, dias de TTL)
 # TTL curto no minuto e longo no dia: o grafico de range largo nunca pede
@@ -180,5 +194,243 @@ if raw.head(1):
     write_catalog()
 else:
     print("[rollup] nenhum registro na janela; nada a fazer")
+
+
+# =============================================================================
+# Posicao (GPS dos tratores) -> heatmap por celula de geohash
+#
+# Aqui a agregacao certa nao e temporal, e espacial: quanto tempo o trator
+# permaneceu em cada pedaco de terreno. Geohash da isso com uma propriedade
+# util de graca -- celulas vizinhas compartilham prefixo, entao begins_with no
+# DynamoDB recorta uma regiao do mapa como between recorta um intervalo.
+#
+# O valor da celula e TEMPO, nao contagem de amostras. Contagem e enviesada
+# pela taxa de reporte: perda de sinal ou reporte adaptativo mentem no mapa.
+# =============================================================================
+
+BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz"
+
+
+def geohash(lat, lon, precisao):
+    """Codifica lat/lon em geohash. Sem dependencia: o Glue nao tem pacote extra.
+
+    O prefixo e a propriedade que interessa aqui: celulas vizinhas no espaco
+    compartilham prefixo, entao begins_with no DynamoDB recorta uma regiao do
+    mapa do mesmo jeito que between recorta um intervalo de tempo.
+    """
+    lat_min, lat_max = -90.0, 90.0
+    lon_min, lon_max = -180.0, 180.0
+    codigo, bits, valor, par = [], 0, 0, True
+    while len(codigo) < precisao:
+        if par:
+            meio = (lon_min + lon_max) / 2
+            if lon >= meio:
+                valor = valor * 2 + 1
+                lon_min = meio
+            else:
+                valor = valor * 2
+                lon_max = meio
+        else:
+            meio = (lat_min + lat_max) / 2
+            if lat >= meio:
+                valor = valor * 2 + 1
+                lat_min = meio
+            else:
+                valor = valor * 2
+                lat_max = meio
+        par = not par
+        bits += 1
+        if bits == 5:
+            codigo.append(BASE32[valor])
+            bits, valor = 0, 0
+    return "".join(codigo)
+
+
+def centro(codigo):
+    """Devolve (lat, lon) do centro da celula e o tamanho dela em graus."""
+    lat_min, lat_max = -90.0, 90.0
+    lon_min, lon_max = -180.0, 180.0
+    par = True
+    for caractere in codigo:
+        valor = BASE32.index(caractere)
+        for deslocamento in (16, 8, 4, 2, 1):
+            bit = 1 if valor & deslocamento else 0
+            if par:
+                meio = (lon_min + lon_max) / 2
+                if bit:
+                    lon_min = meio
+                else:
+                    lon_max = meio
+            else:
+                meio = (lat_min + lat_max) / 2
+                if bit:
+                    lat_min = meio
+                else:
+                    lat_max = meio
+            par = not par
+    return ((lat_min + lat_max) / 2, (lon_min + lon_max) / 2,
+            lat_max - lat_min, lon_max - lon_min)
+
+
+geohash_udf = F.udf(geohash, StringType())
+centro_lat_udf = F.udf(lambda c: centro(c)[0], DoubleType())
+centro_lon_udf = F.udf(lambda c: centro(c)[1], DoubleType())
+
+# A janela de recomputacao do heatmap comeca no INICIO do dia mais antigo
+# alcancado pelo lookback, e nao no lookback em si. Motivo: o item da celula
+# acumula o dia inteiro e e sobrescrito por (pk, sk); recomputar so as ultimas
+# horas e sobrescrever apagaria a permanencia acumulada antes. Recomputando o
+# dia inteiro a escrita continua idempotente.
+heat_inicio = (datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)).replace(
+    hour=0, minute=0, second=0, microsecond=0
+)
+
+posicoes = (
+    spark.read.format("iceberg")
+    .load(f"glue_catalog.{ARGS['glue_database']}.{ARGS['positions_table']}")
+    .filter(F.col("event_time") >= F.lit(heat_inicio))
+    .dropDuplicates(["device_id", "batch_id", "seq"])
+)
+
+if posicoes.head(1):
+    ordem = Window.partitionBy("device_id").orderBy("event_time")
+
+    passo = (
+        posicoes.withColumn("prox_time", F.lead("event_time").over(ordem))
+        .withColumn("prox_lat", F.lead("lat").over(ordem))
+        .withColumn("prox_lon", F.lead("lon").over(ordem))
+        # dt do ponto ate o proximo, limitado: sem o teto, um trator desligado
+        # as 18h e religado as 6h doaria 12 h para a celula onde estacionou.
+        .withColumn(
+            "dt",
+            F.least(
+                F.greatest(
+                    F.coalesce(
+                        F.unix_timestamp("prox_time") - F.unix_timestamp("event_time"),
+                        F.lit(SAMPLE_SECONDS),
+                    ),
+                    F.lit(0),
+                ),
+                F.lit(DT_MAXIMO),
+            ),
+        )
+        # Haversine ate o proximo ponto. Distancia e dt saem do mesmo par, entao
+        # velocidade = distancia / tempo fecha sem o device precisar informar.
+        .withColumn(
+            "dist_m",
+            F.when(
+                F.col("prox_lat").isNull(), F.lit(0.0)
+            ).otherwise(
+                F.lit(2 * 6371000.0)
+                * F.asin(
+                    F.sqrt(
+                        F.pow(F.sin(F.radians(F.col("prox_lat") - F.col("lat")) / 2), 2)
+                        + F.cos(F.radians(F.col("lat")))
+                        * F.cos(F.radians(F.col("prox_lat")))
+                        * F.pow(
+                            F.sin(F.radians(F.col("prox_lon") - F.col("lon")) / 2), 2
+                        )
+                    )
+                )
+            ),
+        )
+        .withColumn("dia", F.date_format("event_time", "yyyy-MM-dd"))
+        .withColumn("gh_grossa", geohash_udf("lat", "lon", F.lit(HEAT_GROSSA)))
+        .withColumn("gh_fina", geohash_udf("lat", "lon", F.lit(HEAT_FINA)))
+    )
+
+    def celulas(chaves, coluna_celula):
+        return (
+            passo.groupBy(*chaves)
+            .agg(
+                F.sum("dt").alias("secs"),
+                F.sum("dist_m").alias("dist_m"),
+                F.count("*").alias("n"),
+            )
+            .withColumn("cell_lat", centro_lat_udf(F.col(coluna_celula)))
+            .withColumn("cell_lon", centro_lon_udf(F.col(coluna_celula)))
+        )
+
+    def escreve_celulas(linhas, monta_chave, coluna_celula, prefixo_sk, expira):
+        table = boto3.resource("dynamodb").Table(DYNAMO_TABLE)
+        with table.batch_writer(overwrite_by_pkeys=["pk", "sk"]) as batch:
+            for linha in linhas:
+                segundos = float(linha["secs"])
+                batch.put_item(
+                    Item={
+                        "pk": monta_chave(linha),
+                        "sk": f"{prefixo_sk}#{linha[coluna_celula]}",
+                        "gh": linha[coluna_celula],
+                        "lat": Decimal(str(round(linha["cell_lat"], 7))),
+                        "lon": Decimal(str(round(linha["cell_lon"], 7))),
+                        "secs": int(segundos),
+                        "dist_m": Decimal(str(round(float(linha["dist_m"]), 2))),
+                        "n": int(linha["n"]),
+                        "expires_at": expira,
+                    }
+                )
+
+    expira_heat = int(
+        (datetime.now(timezone.utc) + timedelta(days=TTL_DAYS * 8)).timestamp()
+    )
+
+    # Camada grossa: poucas celulas por dia, uma Query resolve a fazenda toda.
+    grossa = celulas(["device_id", "dia", "gh_grossa"], "gh_grossa").collect()
+    escreve_celulas(
+        grossa,
+        lambda l: f"HEAT#{l['device_id']}#{l['dia']}",
+        "gh_grossa",
+        f"GH{HEAT_GROSSA}",
+        expira_heat,
+    )
+
+    # Camada fina: a celula grossa vira a particao, entao o viewport do mapa
+    # diz exatamente quais pk pedir -- sem varrer o dia inteiro na resolucao
+    # de 5 m.
+    fina = celulas(["device_id", "dia", "gh_grossa", "gh_fina"], "gh_fina")
+    total_fina = fina.count()
+    if total_fina:
+        fina.repartition(4).foreachPartition(
+            lambda linhas: escreve_celulas(
+                linhas,
+                lambda l: f"HEAT#{l['device_id']}#{l['dia']}#{l['gh_grossa']}",
+                "gh_fina",
+                f"GH{HEAT_FINA}",
+                expira_heat,
+            )
+        )
+
+    # Ultima posicao conhecida: um item sobrescrito por device. E o que um mapa
+    # ao vivo precisa, e sai de graca desta passagem.
+    recentes = (
+        posicoes.withColumn(
+            "ordem", F.row_number().over(
+                Window.partitionBy("device_id").orderBy(F.col("event_time").desc())
+            )
+        )
+        .filter(F.col("ordem") == 1)
+        .collect()
+    )
+    table = boto3.resource("dynamodb").Table(DYNAMO_TABLE)
+    with table.batch_writer(overwrite_by_pkeys=["pk", "sk"]) as batch:
+        for linha in recentes:
+            batch.put_item(
+                Item={
+                    "pk": f"DEV#{linha['device_id']}#position",
+                    "sk": "LATEST",
+                    "lat": Decimal(str(round(float(linha["lat"]), 7))),
+                    "lon": Decimal(str(round(float(linha["lon"]), 7))),
+                    "at": linha["event_time"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "expires_at": expira_heat,
+                }
+            )
+
+    print(
+        f"[heatmap] p{HEAT_GROSSA}: {len(grossa)} celulas | "
+        f"p{HEAT_FINA}: {total_fina} celulas | "
+        f"{len(recentes)} posicoes atuais"
+    )
+else:
+    print("[heatmap] nenhuma posicao na janela; nada a fazer")
 
 job.commit()

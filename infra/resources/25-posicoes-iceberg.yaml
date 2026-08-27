@@ -1,0 +1,79 @@
+  # ---------------------------------------------------------------------------
+  # Posicao dos tratores - tabela Iceberg propria
+  #
+  # Nao entra em telemetry_raw porque o formato e outro: uma leitura escalar
+  # tem (metric, value); uma posicao e um par (lat, lon) que so significa
+  # alguma coisa junto. Separar em duas metricas destruiria o pareamento, e com
+  # ele distancia, velocidade e o proprio ponto no mapa.
+  # ---------------------------------------------------------------------------
+
+  PositionsRawTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      OpenTableFormatInput:
+        IcebergInput:
+          MetadataOperation: CREATE
+          Version: '2'
+      TableInput:
+        Name: positions_raw
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          format: parquet
+          write.parquet.compression-codec: zstd
+        StorageDescriptor:
+          Location: !Sub 's3://${DataBucket}/warehouse/positions_raw/'
+          Columns:
+            - Name: device_id
+              Type: string
+            - Name: event_time
+              Type: timestamp
+              Comment: Momento do fix de GPS no device (ISO-8601 UTC).
+            - Name: ingested_at
+              Type: timestamp
+            - Name: lat
+              Type: double
+            - Name: lon
+              Type: double
+            - Name: speed
+              Type: double
+              Comment: Opcional. O job deriva velocidade de distancia/tempo.
+            - Name: heading
+              Type: double
+            - Name: altitude
+              Type: double
+            - Name: batch_id
+              Type: string
+            - Name: seq
+              Type: int
+              Comment: Unico no lote inteiro, nao por campo.
+
+  PositionsCompaction:
+    Type: AWS::Glue::TableOptimizer
+    DependsOn: PositionsRawTable
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableName: positions_raw
+      Type: compaction
+      TableOptimizerConfiguration:
+        Enabled: true
+        RoleArn: !GetAtt TableOptimizerRole.Arn
+
+  PositionsSnapshotRetention:
+    Type: AWS::Glue::TableOptimizer
+    DependsOn: PositionsCompaction
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableName: positions_raw
+      Type: retention
+      TableOptimizerConfiguration:
+        Enabled: true
+        RoleArn: !GetAtt TableOptimizerRole.Arn
+        RetentionConfiguration:
+          IcebergConfiguration:
+            SnapshotRetentionPeriodInDays: 7
+            NumberOfSnapshotsToRetain: 10
+            CleanExpiredFiles: true
