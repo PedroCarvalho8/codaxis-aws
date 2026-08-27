@@ -173,12 +173,18 @@ rota, quebra nos limites do IoT Core (500 elementos por `PutRecordBatch`,
 128 KB de payload MQTT) e publica:
 
 ```bash
-# só gerar, para inspecionar antes de mandar
-python3 tools/simula_posicoes.py --saida /tmp/posicoes.jsonl
+# um .json por mensagem, com só o payload — pronto para colar no cliente de
+# teste do console; gera junto um publicar.sh que só precisa da AWS CLI
+python3 tools/simula_posicoes.py --lote 250 --saida-dir /tmp/lotes
 
-# gerar e publicar
+# gerar e publicar via boto3
 python3 tools/simula_posicoes.py --publicar --regiao us-east-1
 ```
+
+`--saida` (um `.jsonl` com `{topic, payload}` por linha) serve a um publicador
+próprio, **não** ao console: colar uma dessas linhas publicaria o envelope, e
+a regra faz `SELECT VALUE positions` na raiz — não acharia nada e não daria
+erro visível. Para colar à mão, use `--saida-dir`.
 
 A rota não é ruído: é serpentina de passadas paralelas com manobra de
 cabeceira (onde a permanência se concentra), uma faixa repassada para a

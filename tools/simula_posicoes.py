@@ -82,8 +82,10 @@ def rota(base_lat, base_lon, inicio, args, aleatorio):
             )
             fixes.append({
                 "event_time": agora.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "lat": round(lat, 7),
-                "lon": round(lon, 7),
+                # 6 casas ~ 11 cm. Sete casas dariam 1 cm, precisao que um
+                # receptor de campo nao tem -- e so engorda o payload.
+                "lat": round(lat, 6),
+                "lon": round(lon, 6),
                 "speed": round(v * 3.6, 2),
                 "heading": 90 if sentido == 1 else 270,
             })
@@ -153,7 +155,15 @@ def principal():
     p.add_argument("--prefixo", default="trator")
     p.add_argument("--lote", type=int, default=MAX_ELEMENTOS)
     p.add_argument("--semente", type=int, default=42)
-    p.add_argument("--saida", help="arquivo .jsonl com uma mensagem por linha")
+    p.add_argument("--saida",
+                   help="arquivo .jsonl com uma mensagem por linha, no formato "
+                        "{topic, payload} -- serve a um publicador, NAO para "
+                        "colar no console")
+    p.add_argument("--saida-dir", dest="saida_dir",
+                   help="diretorio com um .json por mensagem, contendo apenas o "
+                        "payload -- pronto para colar no cliente de teste ou "
+                        "usar com 'aws iot-data publish --payload fileb://'. "
+                        "Gera tambem um publicar.sh")
     p.add_argument("--publicar", action="store_true",
                    help="publica no IoT Core (usa as credenciais do ambiente)")
     p.add_argument("--topico", default="devices/{device}/position",
@@ -163,8 +173,8 @@ def principal():
 
     if args.lote > MAX_ELEMENTOS:
         raise SystemExit(f"--lote nao pode passar de {MAX_ELEMENTOS}")
-    if not args.saida and not args.publicar:
-        raise SystemExit("informe --saida, --publicar, ou os dois")
+    if not (args.saida or args.saida_dir or args.publicar):
+        raise SystemExit("informe --saida, --saida-dir, --publicar, ou uma combinacao")
 
     aleatorio = random.Random(args.semente)
     fim = datetime.now(timezone.utc).replace(microsecond=0)
@@ -197,6 +207,32 @@ def principal():
                         "payload": json.loads(corpo),
                     }) + "\n")
         print(f"gravado em {args.saida}")
+
+    if args.saida_dir:
+        import os
+        import stat
+        os.makedirs(args.saida_dir, exist_ok=True)
+        linhas_sh = ["#!/usr/bin/env bash",
+                     "# Publica os lotes gerados. Precisa so da AWS CLI.",
+                     "set -euo pipefail",
+                     'cd "$(dirname "$0")"', ""]
+        for device, _, mensagens in trabalho:
+            topico = args.topico.format(device=device)
+            for indice, corpo in enumerate(mensagens):
+                nome = f"{device}-{indice + 1:02d}.json"
+                with open(os.path.join(args.saida_dir, nome), "w") as arquivo:
+                    arquivo.write(corpo)
+                linhas_sh.append(
+                    f"echo '  {nome}'\n"
+                    f"aws iot-data publish --topic '{topico}' --qos 1 "
+                    f"--payload fileb://{nome}"
+                )
+        caminho_sh = os.path.join(args.saida_dir, "publicar.sh")
+        with open(caminho_sh, "w") as arquivo:
+            arquivo.write("\n".join(linhas_sh) + "\n")
+        os.chmod(caminho_sh, os.stat(caminho_sh).st_mode | stat.S_IEXEC)
+        print(f"gravados {total_msgs} payloads em {args.saida_dir}/ "
+              f"(+ publicar.sh)")
 
     if args.publicar:
         import boto3
