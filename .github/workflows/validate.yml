@@ -16,14 +16,16 @@ jobs:
 
       - run: pip install cfn-lint pyyaml boto3
 
+      # Ordem proposital: se o template estiver desatualizado em relacao as
+      # fontes, os passos seguintes estariam validando um artefato velho.
+      - name: template em dia com as fontes
+        run: python3 build/assemble.py --check
+
       - name: cfn-lint
         run: cfn-lint template.yaml
 
-      - name: script embutido em dia
-        run: python scripts/check_embedded_script.py
+      - name: sintaxe do python
+        run: python3 -m compileall -q glue lambdas
 
-      - name: sintaxe do job
-        run: python -m py_compile rollup_job.py
-
-      - name: handler da API
-        run: python tests/test_api_handler.py
+      - name: handlers da API
+        run: python3 tests/test_api_handler.py

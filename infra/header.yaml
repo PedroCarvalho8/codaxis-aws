@@ -1,0 +1,5 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Pipeline de ingestao IoT: IoT Core (MQTT) -> Amazon Data Firehose ->
+  tabela Apache Iceberg no Glue Data Catalog -> Glue Job de agregacao ->
+  DynamoDB (rollups servidos ao frontend).

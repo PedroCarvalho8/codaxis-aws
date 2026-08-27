@@ -6,13 +6,72 @@ pilha a partir de `template.yaml`, usando os parâmetros de
 `deployment-file.yaml`.
 
 ```
-template.yaml         # a pilha inteira
-deployment-file.yaml  # parâmetros + tags lidos pelo Git sync
-rollup_job.py         # script do Glue Job (a pilha publica no S3)
-frontend/index.html   # dashboard (a pilha publica no S3 + CloudFront)
-scripts/              # checagem de que os arquivos embutidos não divergiram
-tests/                # testes dos handlers da API, sem subir nada na AWS
+template.yaml            # GERADO — não edite; é o que o Git sync aplica
+deployment-file.yaml     # parâmetros + tags lidos pelo Git sync
+Makefile                 # make build | make check
+
+infra/                   # fontes do template
+  header.yaml            #   cabeçalho e Description
+  parameters.yaml        #   corpo de Parameters
+  conditions.yaml        #   corpo de Conditions
+  outputs.yaml           #   corpo de Outputs
+  resources/             #   um arquivo por domínio, concatenados em ordem
+    10-armazenamento.yaml
+    20-catalogo-iceberg.yaml
+    30-firehose.yaml
+    40-iot-core.yaml
+    50-dynamodb.yaml
+    60-glue-job.yaml
+    70-api.yaml
+    80-frontend.yaml
+
+glue/rollup_job.py       # script do Glue Job
+lambdas/                 # handlers, um arquivo por função
+  firehose_transform.py
+  s3_writer.py
+  api_query.py
+  api_catalog.py
+frontend/index.html      # dashboard
+
+build/assemble.py        # monta template.yaml a partir do que está acima
+tests/                   # testes dos handlers, sem subir nada na AWS
 ```
+
+### Por que o template é gerado
+
+O Git sync aplica **um** arquivo de template, exatamente como está no
+repositório. Ele não roda `aws cloudformation package`, então não existe
+`!Include` nativo, e nested stack exigiria subir o template filho para o S3
+antes — o mesmo problema do ovo e da galinha do script do Glue.
+
+O código que precisa viver dentro do template (handlers inline das Lambdas, o
+script do job, a página) somava 32 KB dos 75 KB do arquivo. `build/assemble.py`
+resolve isso concatenando os fragmentos e expandindo marcadores:
+
+```yaml
+      Code:
+        ZipFile: |
+          {{ include: lambdas/api_query.py }}
+```
+
+O conteúdo entra recuado até a coluna do marcador. Assim cada handler é um
+`.py` de verdade — lintável, testável, com syntax highlighting — e o
+`frontend/index.html` abre no navegador.
+
+A concatenação é textual, não uma mesclagem de objetos YAML, porque
+round-trip por parser apagaria os comentários — e aqui eles carregam o porquê
+de várias decisões.
+
+### O ciclo
+
+```bash
+make build     # regenera template.yaml depois de mexer nas fontes
+make check     # não altera nada; é o que o CI roda
+```
+
+`make check` falha se o `template.yaml` commitado estiver atrasado em relação
+às fontes. Isso importa: como o Git sync lê só o template, uma fonte editada
+sem rebuild passaria despercebida e o deploy usaria a versão antiga.
 
 ## Vincular no console
 
@@ -85,28 +144,20 @@ antes de o job ser criado, e portanto antes de o trigger horário disparar.
       Bucket: !Ref DataBucket
       Key: scripts/rollup_job.py
       Content: |
-        <conteúdo de rollup_job.py>
+        {{ include: glue/rollup_job.py }}
 ```
 
 O conteúdo vai numa **propriedade** do custom resource, não no `ZipFile` da
 função: Lambda inline tem teto de 4096 caracteres e o job passa disso. A função
-é só um escritor genérico de ~20 linhas.
+(`lambdas/s3_writer.py`) é só um escritor genérico de ~20 linhas, reaproveitado
+para publicar também o `index.html` e o `config.json` do dashboard.
 
 Efeito colateral útil: editar o script muda a propriedade, o CloudFormation
 chama Update e o arquivo é reenviado no mesmo sync. O script versiona junto com
 a pilha.
 
-### As duas cópias
-
-`rollup_job.py` continua existindo como arquivo — para lint, editor e execução
-local — e seu conteúdo é repetido dentro do template. Se as duas divergirem, o
-job roda código velho sem nenhum sinal. `scripts/check_embedded_script.py`
-compara as duas e falha se saírem de sincronia; o workflow em
-`.github/workflows/validate.yml` roda essa checagem, o `cfn-lint` e o
-`py_compile` a cada push.
-
-Ao editar o job, mude o arquivo **e** o bloco `Content` do template, mantendo o
-recuo do bloco escalar. A checagem avisa se esquecer.
+O script vive em `glue/rollup_job.py` e entra no template pelo mesmo
+mecanismo de include das Lambdas — edite o arquivo e rode `make build`.
 
 ## Rodar sob demanda
 
@@ -269,10 +320,11 @@ conta de um cliente em loop, não protege o dado.
 
 `ApiCorsOrigin` está em `*` por padrão. Aponte para o domínio do frontend.
 
-`tests/test_api_handler.py` exercita os dois handlers sem subir nada na AWS —
-lê o código de dentro do template, troca o DynamoDB por um stub e confere,
-entre outras coisas, que os prefixos de `sk` gerados batem com o formato que o
-Glue Job grava. Roda no CI junto com o `cfn-lint`.
+`tests/test_api_handler.py` exercita os dois handlers sem subir nada na AWS.
+Ele lê o código de dentro do `template.yaml` gerado, e não de `lambdas/*.py`,
+de propósito: o que interessa testar é o artefato que a pilha vai implantar.
+Troca o DynamoDB por um stub e confere, entre outras coisas, que os prefixos de
+`sk` gerados batem com o formato que o Glue Job grava.
 
 ## Dashboard
 
@@ -285,9 +337,9 @@ só em HTTP) e é o que aproveita o `Cache-Control` longo que a API devolve para
 janelas já fechadas.
 
 A página descobre a URL da API em `config.json`, escrito pela pilha com o
-endpoint real. É por isso que o `index.html` do repositório é idêntico ao
-publicado — nenhum placeholder é substituído na publicação — o que permite a
-checagem de divergência.
+endpoint real. É por isso que o `index.html` do repositório é publicado sem
+nenhuma substituição: nada de placeholder, o arquivo que você abre no navegador
+é o que vai para o ar.
 
 O gráfico mostra a faixa mín–máx atrás da linha da média. Média sozinha apaga
 o pico, que num gráfico de sensor costuma ser exatamente o que interessa —

@@ -4,6 +4,10 @@ Description: >
   tabela Apache Iceberg no Glue Data Catalog -> Glue Job de agregacao ->
   DynamoDB (rollups servidos ao frontend).
 
+# ATENCAO: arquivo GERADO por build/assemble.py -- nao edite aqui.
+# As fontes estao em infra/ (fragmentos YAML), lambdas/, glue/ e frontend/.
+# Depois de mexer em qualquer uma delas, rode: make build
+
 Parameters:
 
   ProjectName:
@@ -282,7 +286,6 @@ Resources:
                       out.append({"recordId": rec["recordId"],
                                   "result": "ProcessingFailed"})
               return {"records": out}
-
   TransformFunctionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -713,7 +716,6 @@ Resources:
             print("[rollup] nenhum registro na janela; nada a fazer")
 
         job.commit()
-
   ScriptWriterFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -761,7 +763,6 @@ Resources:
                   cfnresponse.send(
                       event, context, cfnresponse.FAILED, {"Erro": str(exc)}, uri
                   )
-
   ScriptWriterRole:
     Type: AWS::IAM::Role
     Properties:
@@ -1002,7 +1003,6 @@ Resources:
                   },
                   "public, max-age=86400" if encerrado else "public, max-age=30",
               )
-
   QueryFunctionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -1144,7 +1144,6 @@ Resources:
                   },
                   "body": json.dumps(corpo),
               }
-
   CatalogIntegration:
     Type: AWS::ApiGatewayV2::Integration
     Properties:
@@ -1855,7 +1854,6 @@ Resources:
         </script>
         </body>
         </html>
-
   # A URL da API entra aqui, e nao dentro do HTML, para o index.html do
   # repositorio ser identico ao publicado -- o que permite a checagem de
   # divergencia em scripts/check_embedded_script.py.

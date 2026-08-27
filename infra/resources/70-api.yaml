@@ -1,0 +1,148 @@
+  # ---------------------------------------------------------------------------
+  # API de leitura - HTTP API sobre a tabela de rollups
+  #
+  #   GET /devices/{device_id}/metrics/{metric}?from=...&to=...[&granularity=]
+  #
+  # A rota espelha a chave da tabela, entao cada request vira exatamente uma
+  # Query -- nunca um Scan. HTTP API em vez de REST API: ~3x mais barato por
+  # requisicao e CORS nativo, sem precisar de nada que so o REST oferece.
+  # ---------------------------------------------------------------------------
+
+  QueryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-api-query'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt QueryFunctionRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE: !Ref RollupTable
+          CORS_ORIGIN: !Ref ApiCorsOrigin
+      Code:
+        ZipFile: |
+          {{ include: lambdas/api_query.py }}
+  QueryFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: le-rollups
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Somente Query: a API nao tem como cair num Scan da tabela.
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource: !GetAtt RollupTable.Arn
+
+  RollupApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-api'
+      Description: Serie temporal de rollups para o frontend.
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref ApiCorsOrigin
+        AllowMethods:
+          - GET
+          - OPTIONS
+        AllowHeaders:
+          - content-type
+        MaxAge: 300
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RollupApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt QueryFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  ApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'GET /devices/{device_id}/metrics/{metric}'
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref RollupApi
+      StageName: $default
+      AutoDeploy: true
+      # A tabela e PAY_PER_REQUEST: sem teto, um cliente em loop vira conta.
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+        DetailedMetricsEnabled: true
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","rota":"$context.routeKey","status":"$context.status","erroIntegracao":"$context.integration.error","ms":"$context.responseLatency"}'
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}'
+      RetentionInDays: 14
+
+  # Listagem de dispositivos. Existe porque o frontend precisa descobrir o
+  # que consultar; sem o item de catalogo isso seria um Scan.
+  CatalogFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-api-catalog'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt QueryFunctionRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE: !Ref RollupTable
+          CORS_ORIGIN: !Ref ApiCorsOrigin
+      Code:
+        ZipFile: |
+          {{ include: lambdas/api_catalog.py }}
+  CatalogIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RollupApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt CatalogFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  CatalogRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'GET /devices'
+      Target: !Sub 'integrations/${CatalogIntegration}'
+
+  CatalogInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CatalogFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref QueryFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'

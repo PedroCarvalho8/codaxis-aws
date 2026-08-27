@@ -1,0 +1,32 @@
+  # ---------------------------------------------------------------------------
+  # DynamoDB - rollups servidos ao frontend
+  #
+  # pk = DEV#<device_id>#<metric>
+  # sk = AGG#<granularidade>#<inicio_do_bucket>   ex. AGG#1h#2026-08-26T14
+  # Uma Query com between no sk devolve a serie pronta para o grafico.
+  # ---------------------------------------------------------------------------
+
+  RollupTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ProjectName}-rollups'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true

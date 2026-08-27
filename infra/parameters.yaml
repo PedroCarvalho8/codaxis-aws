@@ -1,0 +1,53 @@
+  ProjectName:
+    Type: String
+    Default: iot-telemetry
+    AllowedPattern: '[a-z0-9-]+'
+    Description: Prefixo usado no nome dos recursos.
+
+  DataBucketName:
+    Type: String
+    Default: ''
+    MaxLength: 63
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    ConstraintDescription: >
+      Vazio, ou um nome de bucket S3 valido: 3 a 63 caracteres, apenas
+      minusculas, digitos, ponto e hifen, comecando e terminando com letra ou
+      digito. Maiuscula e underscore sao rejeitados pelo S3.
+    Description: >
+      Nome do bucket S3 criado por esta pilha (warehouse Iceberg, erros do
+      Firehose e script do Glue Job). Deixe vazio para a pilha derivar
+      '<ProjectName>-data-<account-id>-<regiao>', que ja e globalmente unico.
+      Preencha apenas para reaproveitar um nome especifico.
+
+  MqttTopicFilter:
+    Type: String
+    Default: 'devices/+/telemetry'
+    Description: >
+      Filtro de topico da regra do IoT Core. Para basic ingest, o device
+      publica em $aws/rules/<RuleName> e este filtro passa a ser ignorado.
+
+  RollupLookbackHours:
+    Type: Number
+    Default: 3
+    Description: >
+      Janela retroativa reprocessada a cada execucao do Glue Job. Cobre
+      chegada tardia de dados (device offline que sobe batch acumulado).
+
+  HotStoreTtlDays:
+    Type: Number
+    Default: 45
+    Description: Retencao dos rollups no DynamoDB antes do TTL expirar o item.
+
+  ApiCorsOrigin:
+    Type: String
+    Default: '*'
+    Description: >
+      Origem aceita pelo CORS da API de leitura. '*' serve para teste; em
+      producao aponte para o dominio do frontend.
+
+  FirehoseBufferSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+    Description: Intervalo de buffer do Firehose antes de escrever no Iceberg.

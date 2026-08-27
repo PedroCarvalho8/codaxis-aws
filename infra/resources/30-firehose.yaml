@@ -1,0 +1,143 @@
+  # ---------------------------------------------------------------------------
+  # Lambda de transformacao do Firehose
+  # Recebe UMA leitura por invocacao (o batchMode da regra IoT ja separou o
+  # array) e carimba o horario de ingestao. Transformacao no Firehose e 1:1 -
+  # nao da para explodir um registro em varios aqui, por isso o fan-out do
+  # lote acontece na regra do IoT Core.
+  # ---------------------------------------------------------------------------
+
+  TransformFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-firehose-transform'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt TransformFunctionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          {{ include: lambdas/firehose_transform.py }}
+  TransformFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  # ---------------------------------------------------------------------------
+  # Amazon Data Firehose -> Iceberg
+  # ---------------------------------------------------------------------------
+
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/kinesisfirehose/${ProjectName}'
+      RetentionInDays: 14
+
+  FirehoseLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref FirehoseLogGroup
+      LogStreamName: iceberg-delivery
+
+  TelemetryDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn: TelemetryRawTable
+    Properties:
+      DeliveryStreamName: !Sub '${ProjectName}-to-iceberg'
+      DeliveryStreamType: DirectPut
+      IcebergDestinationConfiguration:
+        RoleARN: !GetAtt FirehoseRole.Arn
+        # Telemetria e insert-only. AppendOnly=true libera o Firehose a
+        # escalar o throughput automaticamente.
+        AppendOnly: true
+        CatalogConfiguration:
+          CatalogArn: !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+        DestinationTableConfigurationList:
+          - DestinationDatabaseName: !Ref GlueDatabase
+            DestinationTableName: telemetry_raw
+        BufferingHints:
+          IntervalInSeconds: !Ref FirehoseBufferSeconds
+          SizeInMBs: 128
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt TransformFunction.Arn
+                - ParameterName: BufferIntervalInSeconds
+                  ParameterValue: '60'
+                - ParameterName: BufferSizeInMBs
+                  ParameterValue: '3'
+        RetryOptions:
+          DurationInSeconds: 300
+        s3BackupMode: FailedDataOnly
+        S3Configuration:
+          RoleARN: !GetAtt FirehoseRole.Arn
+          BucketARN: !GetAtt DataBucket.Arn
+          Prefix: 'errors/'
+          ErrorOutputPrefix: 'errors/!{firehose:error-output-type}/'
+          BufferingHints:
+            IntervalInSeconds: 300
+            SizeInMBs: 5
+          CompressionFormat: GZIP
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogGroup
+          LogStreamName: !Ref FirehoseLogStream
+
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: entrega-iceberg
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub '${DataBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetDatabase
+                  - glue:UpdateTable
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/telemetry_raw'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunctionConfiguration
+                Resource: !GetAtt TransformFunction.Arn
+              - Effect: Allow
+                Action: logs:PutLogEvents
+                Resource: !GetAtt FirehoseLogGroup.Arn

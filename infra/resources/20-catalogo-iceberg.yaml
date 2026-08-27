@@ -1,0 +1,131 @@
+  # ---------------------------------------------------------------------------
+  # Glue Data Catalog - database e tabela Iceberg (dado bruto)
+  # ---------------------------------------------------------------------------
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        # Hifen fora: o Firehose exige [a-zA-Z0-9._]+ em
+        # destinationDatabaseName, entao 'iot-telemetry_db' quebraria a
+        # criacao do delivery stream. Mesmo tratamento dado ao nome da regra
+        # do IoT Core mais abaixo.
+        Name: !Sub
+          - '${Name}_db'
+          - Name: !Join ['_', !Split ['-', !Ref ProjectName]]
+        Description: Telemetria de dispositivos IoT.
+
+  TelemetryRawTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      OpenTableFormatInput:
+        IcebergInput:
+          MetadataOperation: CREATE
+          Version: '2'
+      TableInput:
+        Name: telemetry_raw
+        TableType: EXTERNAL_TABLE
+        # table_type e metadata_location sao reservados: o IcebergInput acima
+        # os define, e o Glue rejeita a criacao se vierem declarados aqui.
+        Parameters:
+          format: parquet
+          write.parquet.compression-codec: zstd
+        StorageDescriptor:
+          Location: !Sub 's3://${DataBucket}/warehouse/telemetry_raw/'
+          Columns:
+            - Name: device_id
+              Type: string
+              Comment: Identificador do dispositivo (enviado dentro de cada leitura).
+            - Name: event_time
+              Type: timestamp
+              Comment: Momento da medicao no device (ISO-8601 UTC).
+            - Name: ingested_at
+              Type: timestamp
+              Comment: Momento em que o Firehose recebeu o registro.
+            - Name: metric
+              Type: string
+              Comment: Nome da grandeza medida (ex. temperature, humidity).
+            - Name: value
+              Type: double
+            - Name: unit
+              Type: string
+            - Name: batch_id
+              Type: string
+              Comment: Id do lote enviado pelo device, usado para deduplicacao.
+            - Name: seq
+              Type: int
+              Comment: Sequencia da leitura dentro do lote.
+
+  # Compaction + expiracao de snapshots gerenciadas pelo Glue.
+  # Sem isso, entregas de 5 em 5 minutos viram milhares de arquivos pequenos.
+  TelemetryCompaction:
+    Type: AWS::Glue::TableOptimizer
+    DependsOn: TelemetryRawTable
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableName: telemetry_raw
+      Type: compaction
+      TableOptimizerConfiguration:
+        Enabled: true
+        RoleArn: !GetAtt TableOptimizerRole.Arn
+
+  TelemetrySnapshotRetention:
+    Type: AWS::Glue::TableOptimizer
+    DependsOn: TelemetryCompaction
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableName: telemetry_raw
+      Type: retention
+      TableOptimizerConfiguration:
+        Enabled: true
+        RoleArn: !GetAtt TableOptimizerRole.Arn
+        RetentionConfiguration:
+          IcebergConfiguration:
+            SnapshotRetentionPeriodInDays: 7
+            NumberOfSnapshotsToRetain: 10
+            CleanExpiredFiles: true
+
+  TableOptimizerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: otimiza-tabela-iceberg
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub '${DataBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:UpdateTable
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/telemetry_raw'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*'

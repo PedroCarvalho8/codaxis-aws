@@ -1,0 +1,68 @@
+  # ---------------------------------------------------------------------------
+  # IoT Core - regra que joga a telemetria no Firehose
+  #
+  # Contrato do payload publicado pelo device:
+  #   { "readings": [
+  #       {"device_id":"abc","event_time":"2026-08-26T14:00:00Z",
+  #        "metric":"temperature","value":23.4,"unit":"C",
+  #        "batch_id":"b-778","seq":0}, ... ] }
+  #
+  # SELECT VALUE readings + BatchMode: true faz cada elemento do array virar
+  # um registro no PutRecordBatch (teto de 500 por chamada). Por isso cada
+  # leitura precisa carregar o proprio device_id: depois do fan-out a
+  # informacao do topico nao existe mais.
+  # ---------------------------------------------------------------------------
+
+  TelemetryTopicRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub
+        - '${Name}_telemetry'
+        - Name: !Join ['_', !Split ['-', !Ref ProjectName]]
+      TopicRulePayload:
+        Description: Encaminha lotes de telemetria para o Firehose.
+        AwsIotSqlVersion: '2016-03-23'
+        RuleDisabled: false
+        Sql: !Sub "SELECT VALUE readings FROM '${MqttTopicFilter}'"
+        Actions:
+          - Firehose:
+              DeliveryStreamName: !Ref TelemetryDeliveryStream
+              RoleArn: !GetAtt IoTRuleRole.Arn
+              BatchMode: true
+        ErrorAction:
+          CloudwatchLogs:
+            LogGroupName: !Ref IoTRuleErrorLogGroup
+            RoleArn: !GetAtt IoTRuleRole.Arn
+
+  IoTRuleErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/iot/${ProjectName}/rule-errors'
+      RetentionInDays: 14
+
+  IoTRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: publica-no-firehose
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource: !GetAtt TelemetryDeliveryStream.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !GetAtt IoTRuleErrorLogGroup.Arn

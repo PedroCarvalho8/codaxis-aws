@@ -1,0 +1,32 @@
+  IoTRuleName:
+    Description: >
+      Nome da regra. Para basic ingest, publique em
+      $aws/rules/<este-nome> e pule a cobranca de mensageria do broker.
+    Value: !Ref TelemetryTopicRule
+
+  DeliveryStreamName:
+    Value: !Ref TelemetryDeliveryStream
+
+  RawTable:
+    Description: Tabela Iceberg com o dado bruto.
+    Value: !Sub '${GlueDatabase}.telemetry_raw'
+
+  RollupTableName:
+    Description: Tabela DynamoDB consultada pelo frontend.
+    Value: !Ref RollupTable
+
+  DataBucket:
+    Value: !Ref DataBucket
+
+  ApiEndpoint:
+    Description: Base da API de leitura consumida pelo frontend.
+    Value: !GetAtt RollupApi.ApiEndpoint
+
+  ApiExemplo:
+    Description: Chamada de exemplo (ajuste device, metrica e o intervalo).
+    Value: !Sub >-
+      ${RollupApi.ApiEndpoint}/devices/sensor-teste/metrics/temperature?from=2026-08-26T00:00:00Z&to=2026-08-27T00:00:00Z
+
+  SiteUrl:
+    Description: Dashboard servido pelo CloudFront.
+    Value: !Sub 'https://${SiteDistribution.DomainName}'

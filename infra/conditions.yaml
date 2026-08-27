@@ -1,0 +1,3 @@
+  # Nome de bucket e globalmente unico; account id + regiao resolvem isso sem
+  # exigir que quem faz o deploy invente um nome.
+  DerivarNomeDoBucket: !Equals [!Ref DataBucketName, '']

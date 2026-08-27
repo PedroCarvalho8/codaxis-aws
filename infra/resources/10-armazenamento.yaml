@@ -1,0 +1,32 @@
+  # ---------------------------------------------------------------------------
+  # Armazenamento
+  # ---------------------------------------------------------------------------
+
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !If
+        - DerivarNomeDoBucket
+        - !Sub '${ProjectName}-data-${AWS::AccountId}-${AWS::Region}'
+        - !Ref DataBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expira-erros-do-firehose
+            Status: Enabled
+            Prefix: errors/
+            ExpirationInDays: 30
+          - Id: aborta-multipart-incompleto
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
