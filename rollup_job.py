@@ -127,6 +127,46 @@ if raw.head(1):
                     }
                 )
 
+    def write_catalog():
+        """Grava um item por (device, metrica) sob a particao CATALOG.
+
+        Sem isto, listar os dispositivos exigiria um Scan da tabela. Com o
+        item de catalogo, a API resolve a listagem com uma Query em
+        pk = "CATALOG", que nao cresce com o historico -- so com a
+        quantidade de series distintas.
+
+        O TTL e renovado a cada execucao: um device que parar de reportar
+        some da listagem sozinho depois de TTL_DAYS, sem nenhuma limpeza.
+        """
+        expires = int(
+            (datetime.now(timezone.utc) + timedelta(days=TTL_DAYS)).timestamp()
+        )
+        series = (
+            raw.groupBy("device_id", "metric")
+            .agg(
+                F.max("event_time").alias("last_seen"),
+                F.first("unit", ignorenulls=True).alias("unit"),
+            )
+            .collect()
+        )
+        table = boto3.resource("dynamodb").Table(DYNAMO_TABLE)
+        with table.batch_writer(overwrite_by_pkeys=["pk", "sk"]) as batch:
+            for row in series:
+                batch.put_item(
+                    Item={
+                        "pk": "CATALOG",
+                        "sk": f"DEV#{row['device_id']}#{row['metric']}",
+                        "device_id": row["device_id"],
+                        "metric": row["metric"],
+                        "unit": row["unit"] or "",
+                        "last_seen": row["last_seen"].strftime(
+                            "%Y-%m-%dT%H:%M:%SZ"
+                        ),
+                        "expires_at": expires,
+                    }
+                )
+        print(f"[rollup] catalogo: {len(series)} series")
+
     for granularity in GRANULARITIES:
         df = rollup(granularity)
         total = df.count()
@@ -135,6 +175,9 @@ if raw.head(1):
             # Reparticiona para paralelizar a escrita sem estourar a
             # particao quente do DynamoDB.
             df.repartition(4).foreachPartition(write_partition)
+
+    # Roda no driver: a cardinalidade e o numero de series, nao de linhas.
+    write_catalog()
 else:
     print("[rollup] nenhum registro na janela; nada a fazer")
 

@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Garante que o script embutido no template e o rollup_job.py sao identicos.
+"""Garante que os arquivos embutidos no template continuam iguais aos originais.
 
-O custom resource RollupScript carrega o conteudo do job numa propriedade do
-template. Como rollup_job.py continua existindo como arquivo (para lint,
-editor e execucao local), as duas copias podem divergir sem ninguem notar --
-e o sintoma seria o job rodando codigo velho.
+Dois recursos carregam o conteudo de um arquivo do repositorio numa
+propriedade do template:
+
+  RollupScript   -> rollup_job.py        (script do Glue Job)
+  FrontendIndex  -> frontend/index.html  (pagina do dashboard)
+
+Os arquivos continuam existindo soltos para lint, editor e execucao/abertura
+local. Como sao duas copias, elas podem divergir em silencio -- e o sintoma
+seria o job rodando codigo velho, ou o site publicado nao batendo com o
+repositorio. Esta checagem quebra o build antes disso.
 """
 
 import sys
@@ -28,19 +34,28 @@ Loader.add_multi_constructor(
     ),
 )
 
+PARES = [
+    ("RollupScript", "rollup_job.py"),
+    ("FrontendIndex", "frontend/index.html"),
+]
+
 raiz = Path(__file__).resolve().parent.parent
 template = yaml.load((raiz / "template.yaml").read_text(), Loader=Loader)
-embutido = template["Resources"]["RollupScript"]["Properties"]["Content"]
-arquivo = (raiz / "rollup_job.py").read_text()
 
-if embutido == arquivo:
-    print("ok: RollupScript.Content == rollup_job.py")
-    sys.exit(0)
+falhas = []
+for recurso, caminho in PARES:
+    embutido = template["Resources"][recurso]["Properties"]["Content"]
+    arquivo = (raiz / caminho).read_text()
+    if embutido == arquivo:
+        print(f"ok: {recurso}.Content == {caminho}")
+    else:
+        falhas.append((recurso, caminho))
+        print(f"ERRO: {recurso}.Content divergiu de {caminho}", file=sys.stderr)
 
-print(
-    "ERRO: o script embutido no template divergiu de rollup_job.py.\n"
-    "Reaplique o conteudo do arquivo na propriedade Content do recurso\n"
-    "RollupScript, preservando o recuo do bloco escalar.",
-    file=sys.stderr,
-)
-sys.exit(1)
+if falhas:
+    print(
+        "\nReaplique o conteudo do arquivo na propriedade Content do recurso,\n"
+        "preservando o recuo do bloco escalar.",
+        file=sys.stderr,
+    )
+    sys.exit(1)

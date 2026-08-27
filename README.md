@@ -9,8 +9,9 @@ pilha a partir de `template.yaml`, usando os parâmetros de
 template.yaml         # a pilha inteira
 deployment-file.yaml  # parâmetros + tags lidos pelo Git sync
 rollup_job.py         # script do Glue Job (a pilha publica no S3)
-scripts/              # checagem de que o script embutido não divergiu
-tests/                # teste do handler da API, sem subir nada na AWS
+frontend/index.html   # dashboard (a pilha publica no S3 + CloudFront)
+scripts/              # checagem de que os arquivos embutidos não divergiram
+tests/                # testes dos handlers da API, sem subir nada na AWS
 ```
 
 ## Vincular no console
@@ -177,6 +178,9 @@ Chaves na tabela de rollups:
 ```
 pk = DEV#<device_id>#<metric>
 sk = AGG#<granularidade>#<início do bucket>
+
+pk = CATALOG                      # uma linha por série, para a listagem
+sk = DEV#<device_id>#<metric>
 ```
 
 Últimas 24 h em granularidade horária:
@@ -198,15 +202,33 @@ olhando os mesmos devices.
 
 ## API de leitura
 
-HTTP API (API Gateway v2) com uma rota, servida por Lambda:
+HTTP API (API Gateway v2), duas rotas, cada uma com sua Lambda:
 
 ```
+GET /devices
 GET /devices/{device_id}/metrics/{metric}?from=<ISO>&to=<ISO>[&granularity=]
 ```
 
-A rota espelha a chave da tabela, então cada request vira exatamente uma
-`Query` — a policy da função só concede `dynamodb:Query`, então nem por engano
-vira um `Scan`. A URL base sai no output `ApiEndpoint`.
+Nenhuma das duas faz `Scan` — a policy das funções só concede
+`dynamodb:Query`, então isso não depende de disciplina de quem edita o código.
+A série espelha a chave da tabela. A listagem depende do item de catálogo
+descrito abaixo. A URL base sai no output `ApiEndpoint`.
+
+### Catálogo de dispositivos
+
+`pk = DEV#<device>#<metric>` responde "me dê a série desse device", mas não
+responde "quais devices existem" — isso exigiria varrer a tabela. Por isso o
+Glue Job mantém, a cada execução, um item por série sob uma partição fixa:
+
+```
+pk = CATALOG
+sk = DEV#<device_id>#<metric>     + device_id, metric, unit, last_seen
+```
+
+`GET /devices` vira uma `Query` nessa partição, cujo custo acompanha o número
+de séries distintas e não o tamanho do histórico. O TTL desses itens é
+renovado a cada execução do job: um device que parar de reportar sai da
+listagem sozinho depois de `HotStoreTtlDays`, sem rotina de limpeza.
 
 ```bash
 API=$(aws cloudformation describe-stacks --stack-name <sua-pilha> \
@@ -247,10 +269,33 @@ conta de um cliente em loop, não protege o dado.
 
 `ApiCorsOrigin` está em `*` por padrão. Aponte para o domínio do frontend.
 
-`tests/test_api_handler.py` exercita o handler sem subir nada na AWS — lê o
-código de dentro do template, troca o DynamoDB por um stub e confere, entre
-outras coisas, que os prefixos de `sk` gerados batem com o formato que o Glue
-Job grava. Roda no CI junto com o `cfn-lint`.
+`tests/test_api_handler.py` exercita os dois handlers sem subir nada na AWS —
+lê o código de dentro do template, troca o DynamoDB por um stub e confere,
+entre outras coisas, que os prefixos de `sk` gerados batem com o formato que o
+Glue Job grava. Roda no CI junto com o `cfn-lint`.
+
+## Dashboard
+
+`frontend/index.html` é uma página sem dependências — sem build, sem bundler,
+sem CDN — publicada pela própria pilha. A URL sai no output `SiteUrl`.
+
+O bucket do site **não é público**: quem lê é o CloudFront, via Origin Access
+Control. Isso evita bucket aberto, dá HTTPS (o endpoint de website do S3 serve
+só em HTTP) e é o que aproveita o `Cache-Control` longo que a API devolve para
+janelas já fechadas.
+
+A página descobre a URL da API em `config.json`, escrito pela pilha com o
+endpoint real. É por isso que o `index.html` do repositório é idêntico ao
+publicado — nenhum placeholder é substituído na publicação — o que permite a
+checagem de divergência.
+
+O gráfico mostra a faixa mín–máx atrás da linha da média. Média sozinha apaga
+o pico, que num gráfico de sensor costuma ser exatamente o que interessa —
+é a razão de o rollup guardar as quatro estatísticas.
+
+`index.html` e `config.json` sobem com `Cache-Control: max-age=60`, então o
+CloudFront revalida depois de um deploy em vez de servir versão velha. Não há
+invalidação a rodar.
 
 ## Partition spec do Iceberg
 

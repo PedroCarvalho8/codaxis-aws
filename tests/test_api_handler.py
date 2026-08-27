@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercita o handler da API de leitura sem subir nada na AWS.
+"""Exercita os handlers da API sem subir nada na AWS.
 
 O codigo do handler e lido de dentro do template (recurso QueryFunction), e
 nao de um arquivo solto, para nao existir uma segunda copia que possa
@@ -50,11 +50,23 @@ def achata(condicao, saida=None):
     return saida
 
 
+CATALOGO = [
+    {"device_id": "sensor-02", "metric": "humidity", "unit": "%",
+     "last_seen": "2026-08-27T01:00:00Z"},
+    {"device_id": "sensor-01", "metric": "temperature", "unit": "C",
+     "last_seen": "2026-08-27T02:00:00Z"},
+    {"device_id": "sensor-01", "metric": "humidity", "unit": "%",
+     "last_seen": "2026-08-27T02:00:00Z"},
+]
+
+
 class TabelaFake:
     def query(self, KeyConditionExpression, **kwargs):
-        capturado["sk"] = [
-            v for v in achata(KeyConditionExpression) if v.startswith("AGG#")
-        ]
+        literais = achata(KeyConditionExpression)
+        capturado["chaves"] = literais
+        capturado["sk"] = [v for v in literais if v.startswith("AGG#")]
+        if "CATALOG" in literais:
+            return {"Items": list(CATALOGO)}
         return {
             "Items": [
                 {
@@ -69,10 +81,11 @@ class TabelaFake:
         }
 
 
-def carrega_handler():
+def carrega_handler(recurso):
+    """Importa o codigo inline de um recurso Lambda direto do template."""
     raiz = Path(__file__).resolve().parent.parent
     template = yaml.load((raiz / "template.yaml").read_text(), Loader=Loader)
-    codigo = template["Resources"]["QueryFunction"]["Properties"]["Code"]["ZipFile"]
+    codigo = template["Resources"][recurso]["Properties"]["Code"]["ZipFile"]
 
     boto3.resource = lambda *a, **k: types.SimpleNamespace(Table=lambda nome: TabelaFake())
     os.environ.setdefault("TABLE", "tabela-de-teste")
@@ -81,13 +94,14 @@ def carrega_handler():
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as arquivo:
         arquivo.write(codigo)
         caminho = arquivo.name
-    spec = importlib.util.spec_from_file_location("handler_da_api", caminho)
+    spec = importlib.util.spec_from_file_location("handler_" + recurso, caminho)
     modulo = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(modulo)
     return modulo
 
 
-handler = carrega_handler().handler
+handler = carrega_handler("QueryFunction").handler
+handler_catalogo = carrega_handler("CatalogFunction").handler
 falhas = []
 
 
@@ -143,6 +157,20 @@ checa("cache de janela fechada", resposta["headers"]["cache-control"], "public, 
 aberta = chama({"from": "2026-01-01T00:00:00Z", "to": "2099-01-01T00:00:00Z"})
 checa("cache de janela aberta", aberta["headers"]["cache-control"], "public, max-age=30")
 checa("cors", aberta["headers"]["access-control-allow-origin"], "*")
+
+# ---------------------------------------------------------------- catalogo
+catalogo = json.loads(handler_catalogo({}, None)["body"])
+checa("catalogo: Query em CATALOG", "CATALOG" in capturado["chaves"], True)
+checa("catalogo: contagem de devices", catalogo["count"], 2)
+checa("catalogo: ordem dos devices",
+      [d["device_id"] for d in catalogo["devices"]], ["sensor-01", "sensor-02"])
+checa("catalogo: metricas agrupadas e ordenadas",
+      [m["metric"] for m in catalogo["devices"][0]["metrics"]],
+      ["humidity", "temperature"])
+checa("catalogo: unidade preservada",
+      catalogo["devices"][0]["metrics"][1]["unit"], "C")
+checa("catalogo: cache curto",
+      handler_catalogo({}, None)["headers"]["cache-control"], "public, max-age=60")
 
 print("\n=> todos os casos passaram" if not falhas else f"\n=> {len(falhas)} FALHA(S)")
 sys.exit(1 if falhas else 0)

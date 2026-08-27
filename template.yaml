@@ -658,6 +658,46 @@ Resources:
                             }
                         )
 
+            def write_catalog():
+                """Grava um item por (device, metrica) sob a particao CATALOG.
+
+                Sem isto, listar os dispositivos exigiria um Scan da tabela. Com o
+                item de catalogo, a API resolve a listagem com uma Query em
+                pk = "CATALOG", que nao cresce com o historico -- so com a
+                quantidade de series distintas.
+
+                O TTL e renovado a cada execucao: um device que parar de reportar
+                some da listagem sozinho depois de TTL_DAYS, sem nenhuma limpeza.
+                """
+                expires = int(
+                    (datetime.now(timezone.utc) + timedelta(days=TTL_DAYS)).timestamp()
+                )
+                series = (
+                    raw.groupBy("device_id", "metric")
+                    .agg(
+                        F.max("event_time").alias("last_seen"),
+                        F.first("unit", ignorenulls=True).alias("unit"),
+                    )
+                    .collect()
+                )
+                table = boto3.resource("dynamodb").Table(DYNAMO_TABLE)
+                with table.batch_writer(overwrite_by_pkeys=["pk", "sk"]) as batch:
+                    for row in series:
+                        batch.put_item(
+                            Item={
+                                "pk": "CATALOG",
+                                "sk": f"DEV#{row['device_id']}#{row['metric']}",
+                                "device_id": row["device_id"],
+                                "metric": row["metric"],
+                                "unit": row["unit"] or "",
+                                "last_seen": row["last_seen"].strftime(
+                                    "%Y-%m-%dT%H:%M:%SZ"
+                                ),
+                                "expires_at": expires,
+                            }
+                        )
+                print(f"[rollup] catalogo: {len(series)} series")
+
             for granularity in GRANULARITIES:
                 df = rollup(granularity)
                 total = df.count()
@@ -666,6 +706,9 @@ Resources:
                     # Reparticiona para paralelizar a escrita sem estourar a
                     # particao quente do DynamoDB.
                     df.repartition(4).foreachPartition(write_partition)
+
+            # Roda no driver: a cardinalidade e o numero de series, nao de linhas.
+            write_catalog()
         else:
             print("[rollup] nenhum registro na janela; nada a fazer")
 
@@ -693,17 +736,23 @@ Resources:
               uri = f"s3://{bucket}/{key}"
               try:
                   if event["RequestType"] == "Delete":
-                      # O bucket tem DeletionPolicy Retain, mas pode ter sido
-                      # removido a mao. Falhar aqui travaria o delete da pilha.
+                      # O bucket de dados tem DeletionPolicy Retain, mas pode
+                      # ter sido removido a mao. Falhar aqui travaria o delete
+                      # da pilha.
                       try:
                           s3.delete_object(Bucket=bucket, Key=key)
                       except Exception:
                           pass
                   else:
+                      extra = {}
+                      for campo in ("ContentType", "CacheControl"):
+                          if props.get(campo):
+                              extra[campo] = props[campo]
                       s3.put_object(
                           Bucket=bucket,
                           Key=key,
                           Body=props["Content"].encode("utf-8"),
+                          **extra,
                       )
                   cfnresponse.send(
                       event, context, cfnresponse.SUCCESS, {"Uri": uri}, uri
@@ -734,7 +783,9 @@ Resources:
                 Action:
                   - s3:PutObject
                   - s3:DeleteObject
-                Resource: !Sub '${DataBucket.Arn}/scripts/*'
+                Resource:
+                  - !Sub '${DataBucket.Arn}/scripts/*'
+                  - !Sub '${SiteBucket.Arn}/*'
 
   # ---------------------------------------------------------------------------
   # Glue Job - agregacao 1min / 1h / 1d
@@ -1026,6 +1077,97 @@ Resources:
       LogGroupName: !Sub '/aws/apigateway/${ProjectName}'
       RetentionInDays: 14
 
+  # Listagem de dispositivos. Existe porque o frontend precisa descobrir o
+  # que consultar; sem o item de catalogo isso seria um Scan.
+  CatalogFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-api-catalog'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt QueryFunctionRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE: !Ref RollupTable
+          CORS_ORIGIN: !Ref ApiCorsOrigin
+      Code:
+        ZipFile: |
+          import json
+          import os
+          from collections import defaultdict
+
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          TABELA = boto3.resource("dynamodb").Table(os.environ["TABLE"])
+          ORIGEM = os.environ["CORS_ORIGIN"]
+
+
+          def handler(event, context):
+              # O Glue Job mantem um item por (device, metrica) sob pk = "CATALOG".
+              # Sem ele, listar dispositivos exigiria um Scan da tabela inteira.
+              dispositivos = defaultdict(list)
+              proxima = None
+              while True:
+                  extra = {"ExclusiveStartKey": proxima} if proxima else {}
+                  pagina = TABELA.query(
+                      KeyConditionExpression=Key("pk").eq("CATALOG"), **extra
+                  )
+                  for item in pagina["Items"]:
+                      dispositivos[item["device_id"]].append({
+                          "metric": item["metric"],
+                          "unit": item.get("unit") or None,
+                          "last_seen": item.get("last_seen"),
+                      })
+                  proxima = pagina.get("LastEvaluatedKey")
+                  if not proxima:
+                      break
+
+              corpo = {
+                  "count": len(dispositivos),
+                  "devices": [
+                      {
+                          "device_id": device,
+                          "metrics": sorted(metricas, key=lambda m: m["metric"]),
+                      }
+                      for device, metricas in sorted(dispositivos.items())
+                  ],
+              }
+              return {
+                  "statusCode": 200,
+                  "headers": {
+                      "content-type": "application/json",
+                      "access-control-allow-origin": ORIGEM,
+                      "cache-control": "public, max-age=60",
+                  },
+                  "body": json.dumps(corpo),
+              }
+
+  CatalogIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RollupApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt CatalogFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  CatalogRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'GET /devices'
+      Target: !Sub 'integrations/${CatalogIntegration}'
+
+  CatalogInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CatalogFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
+
   ApiInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -1033,6 +1175,699 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
+
+  # ---------------------------------------------------------------------------
+  # Frontend estatico - bucket privado + CloudFront
+  #
+  # O bucket nao e publico: quem le e a distribuicao, via Origin Access
+  # Control. Alem de evitar bucket aberto, isso da HTTPS -- o endpoint de
+  # website do S3 serve so em HTTP -- e e o CloudFront na frente que aproveita
+  # o Cache-Control longo que a API devolve para janela ja fechada.
+  # ---------------------------------------------------------------------------
+
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-site-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-site-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${ProjectName} - dashboard de telemetria'
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        # PriceClass_All porque as classes menores nao incluem a America do
+        # Sul; com 100 ou 200 o acesso daqui sairia de outro continente.
+        PriceClass: PriceClass_All
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          Compress: true
+          # Managed-CachingOptimized: honra o Cache-Control da origem.
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${SiteBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}'
+
+  FrontendIndex:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ScriptWriterFunction.Arn
+      Bucket: !Ref SiteBucket
+      Key: index.html
+      ContentType: 'text/html; charset=utf-8'
+      # Curto de proposito: o CloudFront revalida em vez de servir uma versao
+      # velha da pagina depois de um deploy, sem precisar de invalidacao.
+      CacheControl: 'public, max-age=60'
+      Content: |
+        <!doctype html>
+        <html lang="pt-BR">
+        <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Telemetria IoT</title>
+        <style>
+          :root {
+            color-scheme: light;
+            --plano:          #f9f9f7;
+            --superficie:     #fcfcfb;
+            --tinta:          #0b0b0b;
+            --tinta-2:        #52514e;
+            --tinta-mud:      #898781;
+            --grade:          #e1e0d9;
+            --eixo:           #c3c2b7;
+            --borda:          rgba(11,11,11,0.10);
+            --serie:          #2a78d6;
+            --serie-faixa:    rgba(42,120,214,0.16);
+            --critico:        #d03b3b;
+          }
+          @media (prefers-color-scheme: dark) {
+            :root:where(:not([data-theme="light"])) {
+              color-scheme: dark;
+              --plano: #0d0d0d; --superficie: #1a1a19; --tinta: #ffffff;
+              --tinta-2: #c3c2b7; --tinta-mud: #898781; --grade: #2c2c2a;
+              --eixo: #383835; --borda: rgba(255,255,255,0.10);
+              --serie: #3987e5; --serie-faixa: rgba(57,135,229,0.20);
+            }
+          }
+          :root[data-theme="dark"] {
+            color-scheme: dark;
+            --plano: #0d0d0d; --superficie: #1a1a19; --tinta: #ffffff;
+            --tinta-2: #c3c2b7; --tinta-mud: #898781; --grade: #2c2c2a;
+            --eixo: #383835; --borda: rgba(255,255,255,0.10);
+            --serie: #3987e5; --serie-faixa: rgba(57,135,229,0.20);
+          }
+
+          * { box-sizing: border-box; }
+          body {
+            margin: 0; background: var(--plano); color: var(--tinta);
+            font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+          }
+          .envelope { max-width: 1040px; margin: 0 auto; padding: 24px 20px 56px; }
+
+          header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+          h1 { font-size: 20px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+          header p { margin: 0; color: var(--tinta-mud); font-size: 13px; }
+          .espacador { flex: 1; }
+
+          button, select {
+            font: inherit; color: var(--tinta); background: var(--superficie);
+            border: 1px solid var(--borda); border-radius: 8px; padding: 7px 10px;
+          }
+          button { cursor: pointer; }
+          button:hover, select:hover { border-color: var(--eixo); }
+          button[aria-pressed="true"] { border-color: var(--serie); color: var(--serie); }
+
+          .filtros {
+            display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end;
+            margin: 20px 0 14px;
+          }
+          .campo { display: flex; flex-direction: column; gap: 4px; }
+          .campo label {
+            font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+            color: var(--tinta-mud);
+          }
+
+          .cartao {
+            background: var(--superficie); border: 1px solid var(--borda);
+            border-radius: 12px; padding: 18px;
+          }
+
+          .legenda { display: flex; gap: 16px; align-items: center;
+                     font-size: 12px; color: var(--tinta-2); margin-bottom: 4px; }
+          .legenda span { display: inline-flex; align-items: center; gap: 6px; }
+          .amostra-linha { width: 18px; height: 2px; background: var(--serie); }
+          .amostra-faixa { width: 18px; height: 10px; background: var(--serie-faixa);
+                           border-radius: 2px; }
+
+          .tiles { display: flex; gap: 22px; flex-wrap: wrap; margin: 16px 0 0;
+                   padding-top: 14px; border-top: 1px solid var(--grade); }
+          .tile-rotulo { font-size: 11px; text-transform: uppercase;
+                         letter-spacing: 0.06em; color: var(--tinta-mud); }
+          .tile-valor { font-size: 22px; font-weight: 600; letter-spacing: -0.01em; }
+
+          svg { display: block; width: 100%; height: auto; }
+          .grade-linha { stroke: var(--grade); stroke-width: 1; }
+          .eixo-linha { stroke: var(--eixo); stroke-width: 1; }
+          .marca-texto { fill: var(--tinta-mud); font-size: 11px;
+                         font-variant-numeric: tabular-nums; }
+          .rotulo-direto { fill: var(--tinta); font-size: 12px; font-weight: 600; }
+          /* O SVG escala com o container e leva o texto junto; em tela estreita o
+             rotulo ficaria ilegivel. Aumentar em unidades de viewBox compensa. */
+          @media (max-width: 700px) {
+            .marca-texto { font-size: 13px; }
+            .rotulo-direto { font-size: 14px; }
+            .legenda { flex-wrap: wrap; gap: 6px 14px; }
+          }
+          .cursor { stroke: var(--eixo); stroke-width: 1; stroke-dasharray: 3 3; }
+
+          .dica {
+            position: absolute; pointer-events: none; opacity: 0; transition: opacity .1s;
+            background: var(--superficie); border: 1px solid var(--borda);
+            border-radius: 8px; padding: 8px 10px; font-size: 12px;
+            box-shadow: 0 4px 16px rgba(0,0,0,.12); white-space: nowrap; z-index: 2;
+          }
+          .dica b { display: block; margin-bottom: 4px; font-weight: 600; }
+          .dica dl { margin: 0; display: grid; grid-template-columns: auto auto;
+                     gap: 1px 12px; }
+          .dica dt { color: var(--tinta-mud); }
+          .dica dd { margin: 0; text-align: right;
+                     font-variant-numeric: tabular-nums; }
+          .area-grafico { position: relative; }
+
+          table { border-collapse: collapse; width: 100%; font-size: 13px;
+                  font-variant-numeric: tabular-nums; margin-top: 14px; }
+          th, td { text-align: right; padding: 6px 8px;
+                   border-bottom: 1px solid var(--grade); }
+          th:first-child, td:first-child { text-align: left; }
+          th { color: var(--tinta-mud); font-weight: 500; font-size: 11px;
+               text-transform: uppercase; letter-spacing: 0.06em; }
+
+          .aviso { color: var(--tinta-2); padding: 28px 0; text-align: center; }
+          .aviso.erro { color: var(--critico); }
+          [hidden] { display: none !important; }
+        </style>
+        </head>
+        <body>
+        <div class="envelope">
+
+          <header>
+            <h1>Telemetria IoT</h1>
+            <p id="resumo-fonte"></p>
+            <span class="espacador"></span>
+            <button id="tema" title="Alternar tema">Tema</button>
+          </header>
+
+          <div class="filtros">
+            <div class="campo">
+              <label for="device">Dispositivo</label>
+              <select id="device"></select>
+            </div>
+            <div class="campo">
+              <label for="metric">Métrica</label>
+              <select id="metric"></select>
+            </div>
+            <div class="campo">
+              <label for="range">Intervalo</label>
+              <select id="range">
+                <option value="6">últimas 6 h</option>
+                <option value="24" selected>últimas 24 h</option>
+                <option value="168">últimos 7 d</option>
+                <option value="720">últimos 30 d</option>
+                <option value="2160">últimos 90 d</option>
+              </select>
+            </div>
+            <button id="recarregar">Atualizar</button>
+            <span class="espacador"></span>
+            <button id="alterna-tabela" aria-pressed="false">Ver tabela</button>
+          </div>
+
+          <div class="cartao">
+            <div class="legenda">
+              <span><i class="amostra-linha"></i> média do bucket</span>
+              <span><i class="amostra-faixa"></i> mínimo–máximo</span>
+              <span id="granularidade"></span>
+            </div>
+
+            <div class="area-grafico">
+              <svg id="grafico" viewBox="0 0 880 320" role="img"
+                   aria-labelledby="titulo-grafico"></svg>
+              <title id="titulo-grafico">Série temporal de leituras agregadas</title>
+              <div class="dica" id="dica"></div>
+            </div>
+
+            <div class="tiles" id="tiles" hidden>
+              <div><div class="tile-rotulo">Mínimo</div>
+                   <div class="tile-valor" id="t-min">—</div></div>
+              <div><div class="tile-rotulo">Máximo</div>
+                   <div class="tile-valor" id="t-max">—</div></div>
+              <div><div class="tile-rotulo">Média</div>
+                   <div class="tile-valor" id="t-avg">—</div></div>
+              <div><div class="tile-rotulo">Amostras</div>
+                   <div class="tile-valor" id="t-n">—</div></div>
+              <div><div class="tile-rotulo">Buckets</div>
+                   <div class="tile-valor" id="t-buckets">—</div></div>
+            </div>
+
+            <div id="aviso" class="aviso">Carregando…</div>
+
+            <div id="envelope-tabela" hidden>
+              <table>
+                <thead><tr>
+                  <th>Início do bucket</th><th>Mín</th><th>Máx</th>
+                  <th>Média</th><th>Amostras</th>
+                </tr></thead>
+                <tbody id="corpo-tabela"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <script>
+        (function () {
+          "use strict";
+
+          var API = null;
+          var catalogo = [];
+          var serie = [];
+          var unidade = "";
+
+          var el = function (id) { return document.getElementById(id); };
+
+          // --------------------------------------------------------------- formato
+          function numero(v, casas) {
+            if (v === null || v === undefined) return "—";
+            return Number(v).toFixed(casas === undefined ? 2 : casas);
+          }
+
+          function comUnidade(v) {
+            var t = numero(v);
+            return unidade ? t + " " + unidade : t;
+          }
+
+          function horario(iso, curto) {
+            var d = new Date(iso);
+            if (isNaN(d)) return iso;
+            var opcoes = curto
+              ? { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }
+              : { dateStyle: "short", timeStyle: "short" };
+            return d.toLocaleString("pt-BR", opcoes);
+          }
+
+          // ------------------------------------------------------------------ rede
+          function pegar(caminho) {
+            return fetch(API + caminho).then(function (r) {
+              if (!r.ok) throw new Error("HTTP " + r.status + " em " + caminho);
+              return r.json();
+            });
+          }
+
+          function mostraAviso(texto, erro) {
+            var a = el("aviso");
+            a.textContent = texto;
+            a.className = erro ? "aviso erro" : "aviso";
+            a.hidden = false;
+            el("grafico").innerHTML = "";
+            el("tiles").hidden = true;
+          }
+
+          // -------------------------------------------------------------- catálogo
+          function carregaCatalogo() {
+            return pegar("/devices").then(function (dados) {
+              catalogo = dados.devices || [];
+              var sel = el("device");
+              sel.innerHTML = "";
+              catalogo.forEach(function (d) {
+                var o = document.createElement("option");
+                o.value = d.device_id;
+                o.textContent = d.device_id;
+                sel.appendChild(o);
+              });
+              el("resumo-fonte").textContent =
+                catalogo.length + (catalogo.length === 1 ? " dispositivo" : " dispositivos");
+              if (!catalogo.length) {
+                mostraAviso("Nenhum dispositivo no catálogo ainda. O Glue Job popula "
+                            + "essa lista na primeira execução após a chegada de dados.");
+                return false;
+              }
+              preencheMetricas();
+              return true;
+            });
+          }
+
+          function dispositivoAtual() {
+            var id = el("device").value;
+            return catalogo.filter(function (d) { return d.device_id === id; })[0];
+          }
+
+          function preencheMetricas() {
+            var d = dispositivoAtual();
+            var sel = el("metric");
+            sel.innerHTML = "";
+            (d ? d.metrics : []).forEach(function (m) {
+              var o = document.createElement("option");
+              o.value = m.metric;
+              o.textContent = m.metric + (m.unit ? " (" + m.unit + ")" : "");
+              sel.appendChild(o);
+            });
+          }
+
+          // ------------------------------------------------------------------ série
+          function carregaSerie() {
+            var device = el("device").value;
+            var metric = el("metric").value;
+            if (!device || !metric) return;
+
+            var horas = Number(el("range").value);
+            var ate = new Date();
+            var de = new Date(ate.getTime() - horas * 3600 * 1000);
+            var qs = "?from=" + de.toISOString().replace(/\.\d+Z$/, "Z")
+                   + "&to=" + ate.toISOString().replace(/\.\d+Z$/, "Z");
+
+            mostraAviso("Carregando…");
+            pegar("/devices/" + encodeURIComponent(device)
+                  + "/metrics/" + encodeURIComponent(metric) + qs)
+              .then(function (dados) {
+                serie = dados.points || [];
+                var m = dispositivoAtual();
+                var achada = m && m.metrics.filter(function (x) {
+                  return x.metric === metric;
+                })[0];
+                unidade = (achada && achada.unit) || "";
+                el("granularidade").textContent =
+                  serie.length ? "granularidade " + dados.granularity : "";
+                if (!serie.length) {
+                  mostraAviso("Sem leituras nesse intervalo.");
+                  return;
+                }
+                el("aviso").hidden = true;
+                desenha();
+                preencheTiles();
+                preencheTabela();
+              })
+              .catch(function (e) { mostraAviso(e.message, true); });
+          }
+
+          // ----------------------------------------------------------------- tiles
+          function preencheTiles() {
+            var minimos = serie.map(function (p) { return p.min; });
+            var maximos = serie.map(function (p) { return p.max; });
+            var amostras = serie.reduce(function (a, p) { return a + p.n; }, 0);
+            var soma = serie.reduce(function (a, p) { return a + p.avg * p.n; }, 0);
+            el("t-min").textContent = comUnidade(Math.min.apply(null, minimos));
+            el("t-max").textContent = comUnidade(Math.max.apply(null, maximos));
+            el("t-avg").textContent = comUnidade(amostras ? soma / amostras : null);
+            el("t-n").textContent = amostras;
+            el("t-buckets").textContent = serie.length;
+            el("tiles").hidden = false;
+          }
+
+          function preencheTabela() {
+            var corpo = el("corpo-tabela");
+            corpo.innerHTML = "";
+            serie.forEach(function (p) {
+              var tr = document.createElement("tr");
+              [horario(p.t), numero(p.min), numero(p.max), numero(p.avg), p.n]
+                .forEach(function (v) {
+                  var td = document.createElement("td");
+                  td.textContent = v;
+                  tr.appendChild(td);
+                });
+              corpo.appendChild(tr);
+            });
+          }
+
+          // --------------------------------------------------------------- gráfico
+          // Recalculado a cada desenho: em tela estreita o grafico fica mais alto
+          // em proporcao, senao vira uma faixa achatada.
+          var L, R, T, B, W, H;
+
+          function medeArea() {
+            var estreito = window.innerWidth < 700;
+            W = estreito ? 420 : 880;
+            H = estreito ? 300 : 320;
+            L = estreito ? 40 : 52;
+            R = estreito ? 12 : 18;
+            T = 16;
+            B = estreito ? 32 : 34;
+            return estreito;
+          }
+
+          function escalaBonita(lo, hi) {
+            if (lo === hi) { lo -= 1; hi += 1; }
+            var passo = Math.pow(10, Math.floor(Math.log10((hi - lo) / 4)));
+            [1, 2, 2.5, 5, 10].some(function (f) {
+              if ((hi - lo) / (passo * f) <= 5) { passo = passo * f; return true; }
+              return false;
+            });
+            return { lo: Math.floor(lo / passo) * passo,
+                     hi: Math.ceil(hi / passo) * passo, passo: passo };
+          }
+
+          function svgNo(tag, atributos) {
+            var n = document.createElementNS("http://www.w3.org/2000/svg", tag);
+            Object.keys(atributos || {}).forEach(function (k) {
+              n.setAttribute(k, atributos[k]);
+            });
+            return n;
+          }
+
+          function desenha() {
+            var svg = el("grafico");
+            var estreito = medeArea();
+            svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+            svg.innerHTML = "";
+
+            var tempos = serie.map(function (p) { return new Date(p.t).getTime(); });
+            var t0 = Math.min.apply(null, tempos), t1 = Math.max.apply(null, tempos);
+            var esc = escalaBonita(
+              Math.min.apply(null, serie.map(function (p) { return p.min; })),
+              Math.max.apply(null, serie.map(function (p) { return p.max; }))
+            );
+
+            var x = function (t) {
+              return t1 === t0 ? L + (W - L - R) / 2
+                : L + ((t - t0) / (t1 - t0)) * (W - L - R);
+            };
+            var y = function (v) {
+              return T + (1 - (v - esc.lo) / (esc.hi - esc.lo)) * (H - T - B);
+            };
+
+            // grade + marcas do eixo y, recessivas
+            for (var v = esc.lo; v <= esc.hi + esc.passo / 2; v += esc.passo) {
+              var yy = y(v);
+              svg.appendChild(svgNo("line", { x1: L, x2: W - R, y1: yy, y2: yy,
+                                              class: "grade-linha" }));
+              var rot = svgNo("text", { x: L - 8, y: yy + 4, "text-anchor": "end",
+                                        class: "marca-texto" });
+              rot.textContent = numero(v, esc.passo < 1 ? 1 : 0);
+              svg.appendChild(rot);
+            }
+
+            // Eixo x: primeira e ultima marca sao obrigatorias; no meio entra so o
+            // que nao encostar. Comparar distancia entre centros nao basta, porque as
+            // pontas sao ancoradas para dentro (senao "middle" corta metade do
+            // rotulo no limite do viewBox) e isso desloca a caixa do texto.
+            var ultimo = serie.length - 1;
+            var FONTE = estreito ? 13 : 11;
+            var FOLGA = 10;
+
+            function caixaRotulo(i) {
+              var largura = horario(serie[i].t, true).length * FONTE * 0.56;
+              var cx = x(tempos[i]);
+              if (i === 0) return [cx, cx + largura];
+              if (i === ultimo) return [cx - largura, cx];
+              return [cx - largura / 2, cx + largura / 2];
+            }
+
+            var marcas = [0];
+            if (ultimo > 0) {
+              var caixaFinal = caixaRotulo(ultimo);
+              for (var i = 1; i < ultimo; i++) {
+                var atual = caixaRotulo(i);
+                var anterior = caixaRotulo(marcas[marcas.length - 1]);
+                if (atual[0] - anterior[1] >= FOLGA
+                    && caixaFinal[0] - atual[1] >= FOLGA) {
+                  marcas.push(i);
+                }
+              }
+              marcas.push(ultimo);
+            }
+
+            marcas.forEach(function (i) {
+              var ancora = i === 0 ? "start" : (i === ultimo ? "end" : "middle");
+              var rot = svgNo("text", { x: x(tempos[i]), y: H - 12,
+                                        "text-anchor": ancora, class: "marca-texto" });
+              rot.textContent = horario(serie[i].t, true);
+              svg.appendChild(rot);
+            });
+            svg.appendChild(svgNo("line", { x1: L, x2: W - R, y1: y(esc.lo),
+                                            y2: y(esc.lo), class: "eixo-linha" }));
+
+            // faixa min-max: mesma entidade da linha, por isso a mesma cor mais clara
+            var ida = serie.map(function (p, i) {
+              return (i ? "L" : "M") + x(tempos[i]) + " " + y(p.max);
+            }).join(" ");
+            var volta = serie.slice().reverse().map(function (p, i) {
+              var j = serie.length - 1 - i;
+              return "L" + x(tempos[j]) + " " + y(p.min);
+            }).join(" ");
+            svg.appendChild(svgNo("path", { d: ida + " " + volta + " Z",
+                                            fill: "var(--serie-faixa)" }));
+
+            // linha da media
+            svg.appendChild(svgNo("path", {
+              d: serie.map(function (p, i) {
+                return (i ? "L" : "M") + x(tempos[i]) + " " + y(p.avg);
+              }).join(" "),
+              fill: "none", stroke: "var(--serie)", "stroke-width": 2,
+              "stroke-linejoin": "round", "stroke-linecap": "round"
+            }));
+
+            // marcadores so quando ha espaco para eles respirarem
+            if (serie.length <= 40) {
+              serie.forEach(function (p, i) {
+                svg.appendChild(svgNo("circle", {
+                  cx: x(tempos[i]), cy: y(p.avg), r: 4, fill: "var(--serie)",
+                  stroke: "var(--superficie)", "stroke-width": 2
+                }));
+              });
+            }
+
+            // rotulo direto so no ultimo ponto, em tinta de texto
+            var pontoFinal = serie[ultimo];
+            var rotulo = svgNo("text", {
+              x: Math.min(x(t1) + 6, W - 4), y: y(pontoFinal.avg) - 10,
+              "text-anchor": x(t1) > W - 60 ? "end" : "start", class: "rotulo-direto"
+            });
+            rotulo.textContent = comUnidade(pontoFinal.avg);
+            svg.appendChild(rotulo);
+
+            ligaCursor(svg, tempos, x, y);
+          }
+
+          function ligaCursor(svg, tempos, x, y) {
+            var cursor = svgNo("line", { class: "cursor", y1: T, y2: H - B,
+                                         x1: -99, x2: -99 });
+            var alvo = svgNo("circle", { r: 5, fill: "none", stroke: "var(--serie)",
+                                         "stroke-width": 2, cx: -99, cy: -99 });
+            svg.appendChild(cursor);
+            svg.appendChild(alvo);
+
+            var dica = el("dica");
+            var area = svg.parentNode;
+
+            function esconde() {
+              dica.style.opacity = 0;
+              cursor.setAttribute("x1", -99); cursor.setAttribute("x2", -99);
+              alvo.setAttribute("cx", -99);
+            }
+
+            svg.addEventListener("mouseleave", esconde);
+            svg.addEventListener("mousemove", function (evento) {
+              var caixa = svg.getBoundingClientRect();
+              var px = (evento.clientX - caixa.left) * (W / caixa.width);
+              var melhor = 0, dist = Infinity;
+              tempos.forEach(function (t, i) {
+                var d = Math.abs(x(t) - px);
+                if (d < dist) { dist = d; melhor = i; }
+              });
+              var p = serie[melhor];
+              var cx = x(tempos[melhor]);
+              cursor.setAttribute("x1", cx); cursor.setAttribute("x2", cx);
+              alvo.setAttribute("cx", cx); alvo.setAttribute("cy", y(p.avg));
+
+              dica.innerHTML =
+                "<b>" + horario(p.t) + "</b><dl>"
+                + "<dt>máx</dt><dd>" + comUnidade(p.max) + "</dd>"
+                + "<dt>média</dt><dd>" + comUnidade(p.avg) + "</dd>"
+                + "<dt>mín</dt><dd>" + comUnidade(p.min) + "</dd>"
+                + "<dt>amostras</dt><dd>" + p.n + "</dd></dl>";
+              dica.style.opacity = 1;
+              var escala = caixa.width / W;
+              var esquerda = cx * escala + 14;
+              if (esquerda + dica.offsetWidth > caixa.width) {
+                esquerda = cx * escala - dica.offsetWidth - 14;
+              }
+              dica.style.left = Math.max(0, esquerda) + "px";
+              dica.style.top = Math.max(0, y(p.avg) * escala - 10) + "px";
+            });
+          }
+
+          // ---------------------------------------------------------------- eventos
+          el("device").addEventListener("change", function () {
+            preencheMetricas(); carregaSerie();
+          });
+          el("metric").addEventListener("change", carregaSerie);
+          el("range").addEventListener("change", carregaSerie);
+          el("recarregar").addEventListener("click", carregaSerie);
+
+          el("alterna-tabela").addEventListener("click", function () {
+            var mostrando = el("envelope-tabela").hidden;
+            el("envelope-tabela").hidden = !mostrando;
+            this.setAttribute("aria-pressed", String(mostrando));
+            this.textContent = mostrando ? "Ocultar tabela" : "Ver tabela";
+          });
+
+          el("tema").addEventListener("click", function () {
+            var atual = document.documentElement.getAttribute("data-theme");
+            var escuro = atual
+              ? atual === "dark"
+              : matchMedia("(prefers-color-scheme: dark)").matches;
+            document.documentElement.setAttribute("data-theme", escuro ? "light" : "dark");
+            if (serie.length) desenha();
+          });
+
+          window.addEventListener("resize", function () { if (serie.length) desenha(); });
+
+          // ----------------------------------------------------------------- início
+          fetch("config.json")
+            .then(function (r) { return r.json(); })
+            .then(function (cfg) {
+              API = String(cfg.apiBase).replace(/\/$/, "");
+              return carregaCatalogo();
+            })
+            .then(function (ok) { if (ok) carregaSerie(); })
+            .catch(function (e) { mostraAviso(e.message, true); });
+        })();
+        </script>
+        </body>
+        </html>
+
+  # A URL da API entra aqui, e nao dentro do HTML, para o index.html do
+  # repositorio ser identico ao publicado -- o que permite a checagem de
+  # divergencia em scripts/check_embedded_script.py.
+  FrontendConfig:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ScriptWriterFunction.Arn
+      Bucket: !Ref SiteBucket
+      Key: config.json
+      ContentType: application/json
+      CacheControl: 'public, max-age=60'
+      Content: !Sub '{"apiBase": "${RollupApi.ApiEndpoint}"}'
 
 Outputs:
 
@@ -1064,3 +1899,7 @@ Outputs:
     Description: Chamada de exemplo (ajuste device, metrica e o intervalo).
     Value: !Sub >-
       ${RollupApi.ApiEndpoint}/devices/sensor-teste/metrics/temperature?from=2026-08-26T00:00:00Z&to=2026-08-27T00:00:00Z
+
+  SiteUrl:
+    Description: Dashboard servido pelo CloudFront.
+    Value: !Sub 'https://${SiteDistribution.DomainName}'
