@@ -1,0 +1,25 @@
+# Arquivo de deployment do CloudFormation Git sync.
+#
+# Ao criar a pilha no console (Create stack -> With Git / Sync from Git), este
+# e o arquivo apontado em "Deployment file path". O CloudFormation le daqui o
+# caminho do template, os parametros e as tags, e reaplica a pilha a cada push
+# nesta branch.
+#
+# ATENCAO: DataBucketName nao tem default no template porque nome de bucket S3
+# e globalmente unico. Troque o placeholder abaixo ANTES do primeiro sync, ou o
+# deploy falha em CREATE_FAILED no recurso DataBucket.
+
+template-file-path: template.yaml
+
+parameters:
+  ProjectName: iot-telemetry
+  DataBucketName: iot-telemetry-data-CHANGE-ME
+  MqttTopicFilter: devices/+/telemetry
+  RollupLookbackHours: '3'
+  HotStoreTtlDays: '45'
+  FirehoseBufferSeconds: '300'
+
+tags:
+  project: iot-telemetry
+  component: ingestao-telemetria
+  managed-by: cloudformation-git-sync
