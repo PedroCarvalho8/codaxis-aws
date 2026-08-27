@@ -36,6 +36,32 @@ console primeiro, e o sync seguinte recria do zero. Falha na *validação* do
 change set, como um parâmetro fora do `AllowedPattern`, não tem esse problema:
 nenhum recurso é tocado e o próximo push já tenta de novo.
 
+### Recursos que sobrevivem ao delete da pilha
+
+`DataBucket` e `RollupTable` têm `DeletionPolicy: Retain` — o dado não some
+junto com a pilha. O preço aparece ao recriar: os dois já existem, e a
+validação prévia reprova o change set com
+
+```
+The following hook(s)/validation failed: [AWS::EarlyValidation::ResourceExistenceCheck]
+```
+
+Nenhum recurso é tocado nesse caso. Veja qual deles colidiu e limpe antes de
+sincronizar de novo:
+
+```bash
+aws cloudformation describe-stack-events --stack-name <sua-pilha> --max-items 20
+
+aws dynamodb delete-table --table-name iot-telemetry-rollups
+aws s3 rb s3://<nome-do-bucket> --force
+```
+
+A tabela pode ficar para trás até de um `CREATE` que falhou lá no começo:
+`RollupTable` não depende de nada, então o CloudFormation a cria em paralelo,
+antes de recursos mais lentos falharem. Enquanto o pipeline não tiver dado
+real, vale considerar tirar o `Retain` dos dois e recolocar antes de valer —
+senão cada ciclo de recriar a pilha pede essa limpeza manual.
+
 A role de IAM que o Git sync assume precisa poder criar os recursos da pilha,
 inclusive as roles de IAM que ela declara (equivale ao `CAPABILITY_IAM` do
 CLI). Depois de vinculado, o ciclo é `commit → push → sync`; alterar parâmetro
