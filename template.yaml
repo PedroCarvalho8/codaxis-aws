@@ -103,7 +103,13 @@ Resources:
     Properties:
       CatalogId: !Ref AWS::AccountId
       DatabaseInput:
-        Name: !Sub '${ProjectName}_db'
+        # Hifen fora: o Firehose exige [a-zA-Z0-9._]+ em
+        # destinationDatabaseName, entao 'iot-telemetry_db' quebraria a
+        # criacao do delivery stream. Mesmo tratamento dado ao nome da regra
+        # do IoT Core mais abaixo.
+        Name: !Sub
+          - '${Name}_db'
+          - Name: !Join ['_', !Split ['-', !Ref ProjectName]]
         Description: Telemetria de dispositivos IoT.
 
   TelemetryRawTable:
