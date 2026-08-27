@@ -1,0 +1,26 @@
+name: valida template
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  valida:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install cfn-lint pyyaml
+
+      - name: cfn-lint
+        run: cfn-lint template.yaml
+
+      - name: script embutido em dia
+        run: python scripts/check_embedded_script.py
+
+      - name: sintaxe do job
+        run: python -m py_compile rollup_job.py

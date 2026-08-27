@@ -8,7 +8,8 @@ pilha a partir de `template.yaml`, usando os parâmetros de
 ```
 template.yaml         # a pilha inteira
 deployment-file.yaml  # parâmetros + tags lidos pelo Git sync
-rollup_job.py         # script do Glue Job (vai para o S3, não para a pilha)
+rollup_job.py         # script do Glue Job (a pilha publica no S3)
+scripts/              # checagem de que o script embutido não divergiu
 ```
 
 ## Vincular no console
@@ -67,27 +68,47 @@ inclusive as roles de IAM que ela declara (equivale ao `CAPABILITY_IAM` do
 CLI). Depois de vinculado, o ciclo é `commit → push → sync`; alterar parâmetro
 é editar `deployment-file.yaml` e dar push, não mexer no console.
 
-## Ordem de deploy
+## O script do Glue Job
 
-O bucket é criado pela própria pilha e o Glue Job aponta para um script que
-ainda não existe no momento do `create-stack`. O CloudFormation não valida a
-existência do script, então o deploy passa — só não deixe o job disparar antes
-do upload:
+Não há passo manual de upload. O recurso `RollupScript` publica
+`scripts/rollup_job.py` no bucket durante o deploy, e o job aponta para ele via
+`!GetAtt RollupScript.Uri` — o que também garante a ordem: o objeto existe
+antes de o job ser criado, e portanto antes de o trigger horário disparar.
 
-```bash
-BUCKET=$(aws cloudformation describe-stacks --stack-name iot-telemetry \
-  --query "Stacks[0].Outputs[?OutputKey=='DataBucket'].OutputValue" --output text)
-
-aws s3 cp rollup_job.py s3://$BUCKET/scripts/rollup_job.py
+```yaml
+  RollupScript:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ScriptWriterFunction.Arn
+      Bucket: !Ref DataBucket
+      Key: scripts/rollup_job.py
+      Content: |
+        <conteúdo de rollup_job.py>
 ```
 
-O `AWS::Glue::Trigger` está com `StartOnCreation: true` e roda aos 5 minutos de
-cada hora — se o primeiro sync terminar perto do minuto :05, a primeira
-execução falha por script ausente e a seguinte já pega o arquivo. Para não ver
-essa falha, suba o script logo após o `CREATE_COMPLETE`, ou entre com
-`StartOnCreation: false` e habilite o trigger depois.
+O conteúdo vai numa **propriedade** do custom resource, não no `ZipFile` da
+função: Lambda inline tem teto de 4096 caracteres e o job passa disso. A função
+é só um escritor genérico de ~20 linhas.
 
-Para testar imediatamente:
+Efeito colateral útil: editar o script muda a propriedade, o CloudFormation
+chama Update e o arquivo é reenviado no mesmo sync. O script versiona junto com
+a pilha.
+
+### As duas cópias
+
+`rollup_job.py` continua existindo como arquivo — para lint, editor e execução
+local — e seu conteúdo é repetido dentro do template. Se as duas divergirem, o
+job roda código velho sem nenhum sinal. `scripts/check_embedded_script.py`
+compara as duas e falha se saírem de sincronia; o workflow em
+`.github/workflows/validate.yml` roda essa checagem, o `cfn-lint` e o
+`py_compile` a cada push.
+
+Ao editar o job, mude o arquivo **e** o bloco `Content` do template, mantendo o
+recuo do bloco escalar. A checagem avisa se esquecer.
+
+## Rodar sob demanda
+
+Para disparar sem esperar o cron:
 
 ```bash
 aws glue start-job-run --job-name iot-telemetry-rollups
@@ -104,10 +125,6 @@ aws cloudformation deploy \
       MqttTopicFilter='devices/+/telemetry' \
   --capabilities CAPABILITY_IAM
 
-BUCKET=$(aws cloudformation describe-stacks --stack-name iot-telemetry \
-  --query "Stacks[0].Outputs[?OutputKey=='DataBucket'].OutputValue" --output text)
-
-aws s3 cp rollup_job.py s3://$BUCKET/scripts/rollup_job.py
 ```
 
 Para fixar um nome de bucket em vez do derivado, acrescente
@@ -213,6 +230,3 @@ degrada rápido conforme o histórico cresce.
 - **Tabela Iceberg de agregados**: hoje o rollup vai só para o DynamoDB. Se
   quiser histórico agregado além do TTL, adicione uma segunda tabela Iceberg
   e um `MERGE INTO` no job antes da escrita no Dynamo.
-- **Upload do `rollup_job.py`**: o Git sync só aplica a pilha; o script não
-  chega ao S3 sozinho. Se quiser automatizar, um workflow de CI que faz
-  `aws s3 cp` no mesmo push resolve.
