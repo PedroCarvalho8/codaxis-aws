@@ -22,18 +22,19 @@ rollup_job.py         # script do Glue Job (vai para o S3, não para a pilha)
 | Deployment file path | `deployment-file.yaml` |
 | Stack name | `iot-telemetry` (ou o que preferir) |
 
-Antes do primeiro sync, **edite `DataBucketName`** em `deployment-file.yaml` —
-nome de bucket S3 é globalmente único e o parâmetro não tem default. O
-placeholder é propositalmente inválido, e o template valida o formato
-(`AllowedPattern`), então um nome fora das regras do S3 é barrado já na
-validação do change set em vez de estourar no meio do create. Regras: 3 a 63
-caracteres, só minúsculas, dígitos, ponto e hífen, começando e terminando com
-letra ou dígito. `iot-telemetry-data-<account-id>-<região>` costuma resolver a
-unicidade.
+Não é preciso inventar nome de bucket. Com `DataBucketName` vazio — que é o
+default e o que o `deployment-file.yaml` faz — a pilha deriva
+`<ProjectName>-data-<account-id>-<região>`, já globalmente único. O nome
+efetivo sai no output `DataBucket`. Só preencha o parâmetro para reaproveitar
+um bucket de nome específico; nesse caso o `AllowedPattern` valida o formato na
+criação do change set (3 a 63 caracteres, só minúsculas, dígitos, ponto e
+hífen), em vez de deixar o erro estourar no meio do create.
 
 Se um deploy falhar no `CREATE`, a pilha para em `ROLLBACK_COMPLETE` — estado
 que não aceita update. **Push de correção não conserta**: delete a pilha no
-console primeiro, e o sync seguinte recria do zero.
+console primeiro, e o sync seguinte recria do zero. Falha na *validação* do
+change set, como um parâmetro fora do `AllowedPattern`, não tem esse problema:
+nenhum recurso é tocado e o próximo push já tenta de novo.
 
 A role de IAM que o Git sync assume precisa poder criar os recursos da pilha,
 inclusive as roles de IAM que ela declara (equivale ao `CAPABILITY_IAM` do
@@ -69,19 +70,22 @@ aws glue start-job-run --job-name iot-telemetry-rollups
 ### Deploy pelo CLI (alternativa ao Git sync)
 
 ```bash
-BUCKET=meu-bucket-iot-telemetria   # precisa ser globalmente único
-
 aws cloudformation deploy \
   --template-file template.yaml \
   --stack-name iot-telemetry \
   --parameter-overrides \
       ProjectName=iot-telemetry \
-      DataBucketName=$BUCKET \
       MqttTopicFilter='devices/+/telemetry' \
   --capabilities CAPABILITY_IAM
 
+BUCKET=$(aws cloudformation describe-stacks --stack-name iot-telemetry \
+  --query "Stacks[0].Outputs[?OutputKey=='DataBucket'].OutputValue" --output text)
+
 aws s3 cp rollup_job.py s3://$BUCKET/scripts/rollup_job.py
 ```
+
+Para fixar um nome de bucket em vez do derivado, acrescente
+`DataBucketName=<nome>` ao `--parameter-overrides`.
 
 Não misture os dois caminhos na mesma pilha: com o sync ativo, um deploy manual
 é sobrescrito no push seguinte.

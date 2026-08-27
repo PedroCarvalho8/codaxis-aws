@@ -5,19 +5,16 @@
 # caminho do template, os parametros e as tags, e reaplica a pilha a cada push
 # nesta branch.
 #
-# ATENCAO: DataBucketName nao tem default no template porque nome de bucket S3
-# e globalmente unico. Troque o placeholder abaixo ANTES do primeiro sync.
-# Ele e propositalmente invalido (maiusculas) para o template barrar na
-# validacao do change set, com mensagem clara, em vez de quebrar no meio do
-# create. Regras do S3: 3 a 63 caracteres, so minusculas, digitos, ponto e
-# hifen, comecando e terminando com letra ou digito.
-# Sugestao: iot-telemetry-data-<account-id>-<regiao>
+# DataBucketName fica de fora de proposito: vazio, o template deriva
+# '<ProjectName>-data-<account-id>-<regiao>', que ja e globalmente unico. O
+# nome efetivo sai no output DataBucket da pilha. So declare esse parametro
+# para reaproveitar um bucket de nome especifico -- e nesse caso valem as
+# regras do S3 (3 a 63 caracteres, so minusculas, digitos, ponto e hifen).
 
 template-file-path: template.yaml
 
 parameters:
   ProjectName: iot-telemetry
-  DataBucketName: TROQUE-POR-UM-NOME-DE-BUCKET-UNICO
   MqttTopicFilter: devices/+/telemetry
   RollupLookbackHours: '3'
   HotStoreTtlDays: '45'
