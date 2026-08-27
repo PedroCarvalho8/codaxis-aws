@@ -10,6 +10,7 @@ a mesma janela produz o mesmo resultado. Isso permite rodar com lookback
 generoso para absorver dado que chegou atrasado.
 """
 
+import math
 import sys
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -21,7 +22,13 @@ from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from pyspark.sql import Window
 from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType, StringType
+from pyspark.sql.types import (
+    ArrayType,
+    DoubleType,
+    StringType,
+    StructField,
+    StructType,
+)
 
 ARGS = getResolvedOptions(
     sys.argv,
@@ -272,7 +279,53 @@ def centro(codigo):
             lat_max - lat_min, lon_max - lon_min)
 
 
-geohash_udf = F.udf(geohash, StringType())
+def metros_entre(lat_a, lon_a, lat_b, lon_b):
+    raio = 6371000.0
+    d_lat = math.radians(lat_b - lat_a)
+    d_lon = math.radians(lon_b - lon_a)
+    a = (
+        math.sin(d_lat / 2) ** 2
+        + math.cos(math.radians(lat_a))
+        * math.cos(math.radians(lat_b))
+        * math.sin(d_lon / 2) ** 2
+    )
+    return 2 * raio * math.asin(math.sqrt(a))
+
+
+def trecho_em_celulas(lat, lon, prox_lat, prox_lon, precisao, passo_m):
+    """Distribui um trecho entre as celulas que ele CRUZA, com peso.
+
+    Atribuir o trecho inteiro a celula do ponto inicial subestima cobertura
+    sempre que o deslocamento entre fixes for maior que a celula -- e ele e:
+    a 7 km/h com fix a cada 5 s o trator anda ~9,7 m, contra 4,8 m de celula
+    fina. O heatmap sairia pontilhado, com buraco em toda celula pulada.
+
+    A amostragem do segmento e aproximada, mas o erro fica limitado ao passo,
+    e o resultado deixa de depender da taxa de reporte do device.
+    """
+    if prox_lat is None or prox_lon is None:
+        return [(geohash(lat, lon, precisao), 1.0)]
+    distancia = metros_entre(lat, lon, prox_lat, prox_lon)
+    passos = max(1, min(200, int(distancia / passo_m) + 1))
+    contagem = {}
+    for i in range(passos):
+        fracao = (i + 0.5) / passos
+        codigo = geohash(
+            lat + (prox_lat - lat) * fracao,
+            lon + (prox_lon - lon) * fracao,
+            precisao,
+        )
+        contagem[codigo] = contagem.get(codigo, 0) + 1
+    return [(codigo, n / passos) for codigo, n in contagem.items()]
+
+
+TRECHO = ArrayType(
+    StructType([
+        StructField("gh", StringType()),
+        StructField("peso", DoubleType()),
+    ])
+)
+trecho_udf = F.udf(trecho_em_celulas, TRECHO)
 centro_lat_udf = F.udf(lambda c: centro(c)[0], DoubleType())
 centro_lon_udf = F.udf(lambda c: centro(c)[1], DoubleType())
 
@@ -335,37 +388,60 @@ if posicoes.head(1):
             ),
         )
         .withColumn("dia", F.date_format("event_time", "yyyy-MM-dd"))
-        .withColumn("gh_grossa", geohash_udf("lat", "lon", F.lit(HEAT_GROSSA)))
-        .withColumn("gh_fina", geohash_udf("lat", "lon", F.lit(HEAT_FINA)))
+        # Passo de amostragem ~ metade da celula: fino o bastante para nao
+        # pular celula, grosso o bastante para nao explodir o numero de passos.
+        .withColumn(
+            "trechos_grossa",
+            trecho_udf("lat", "lon", "prox_lat", "prox_lon",
+                       F.lit(HEAT_GROSSA), F.lit(70.0)),
+        )
+        .withColumn(
+            "trechos_fina",
+            trecho_udf("lat", "lon", "prox_lat", "prox_lon",
+                       F.lit(HEAT_FINA), F.lit(2.0)),
+        )
     )
 
-    def celulas(chaves, coluna_celula):
+    def celulas(coluna_trechos, chaves_extras=()):
+        """Explode os trechos e agrega por celula, ponderando dt e distancia."""
         return (
-            passo.groupBy(*chaves)
+            passo.select(
+                "device_id", "dia", "dt", "dist_m",
+                F.explode(coluna_trechos).alias("trecho"),
+            )
+            .select(
+                "device_id", "dia",
+                F.col("trecho.gh").alias("gh"),
+                (F.col("dt") * F.col("trecho.peso")).alias("dt"),
+                (F.col("dist_m") * F.col("trecho.peso")).alias("dist_m"),
+                F.col("trecho.peso").alias("peso"),
+            )
+            .groupBy("device_id", "dia", "gh", *chaves_extras)
             .agg(
                 F.sum("dt").alias("secs"),
                 F.sum("dist_m").alias("dist_m"),
-                F.count("*").alias("n"),
+                # n conta fixes equivalentes, nao linhas: um fix dividido
+                # entre tres celulas contribui um terco para cada.
+                F.sum("peso").alias("n"),
             )
-            .withColumn("cell_lat", centro_lat_udf(F.col(coluna_celula)))
-            .withColumn("cell_lon", centro_lon_udf(F.col(coluna_celula)))
+            .withColumn("cell_lat", centro_lat_udf(F.col("gh")))
+            .withColumn("cell_lon", centro_lon_udf(F.col("gh")))
         )
 
-    def escreve_celulas(linhas, monta_chave, coluna_celula, prefixo_sk, expira):
+    def escreve_celulas(linhas, monta_chave, prefixo_sk, expira):
         table = boto3.resource("dynamodb").Table(DYNAMO_TABLE)
         with table.batch_writer(overwrite_by_pkeys=["pk", "sk"]) as batch:
             for linha in linhas:
-                segundos = float(linha["secs"])
                 batch.put_item(
                     Item={
                         "pk": monta_chave(linha),
-                        "sk": f"{prefixo_sk}#{linha[coluna_celula]}",
-                        "gh": linha[coluna_celula],
+                        "sk": f"{prefixo_sk}#{linha['gh']}",
+                        "gh": linha["gh"],
                         "lat": Decimal(str(round(linha["cell_lat"], 7))),
                         "lon": Decimal(str(round(linha["cell_lon"], 7))),
-                        "secs": int(segundos),
+                        "secs": int(round(float(linha["secs"]))),
                         "dist_m": Decimal(str(round(float(linha["dist_m"]), 2))),
-                        "n": int(linha["n"]),
+                        "n": int(round(float(linha["n"]))),
                         "expires_at": expira,
                     }
                 )
@@ -375,26 +451,26 @@ if posicoes.head(1):
     )
 
     # Camada grossa: poucas celulas por dia, uma Query resolve a fazenda toda.
-    grossa = celulas(["device_id", "dia", "gh_grossa"], "gh_grossa").collect()
+    grossa = celulas("trechos_grossa").collect()
     escreve_celulas(
         grossa,
         lambda l: f"HEAT#{l['device_id']}#{l['dia']}",
-        "gh_grossa",
         f"GH{HEAT_GROSSA}",
         expira_heat,
     )
 
-    # Camada fina: a celula grossa vira a particao, entao o viewport do mapa
-    # diz exatamente quais pk pedir -- sem varrer o dia inteiro na resolucao
-    # de 5 m.
-    fina = celulas(["device_id", "dia", "gh_grossa", "gh_fina"], "gh_fina")
+    # Camada fina: a particao e o PREFIXO da propria celula fina, entao as
+    # duas camadas nao tem como divergir. O viewport do mapa diz quais pk
+    # pedir, sem varrer o dia inteiro na resolucao de 5 m.
+    fina = celulas("trechos_fina").withColumn(
+        "gh_grossa", F.substring(F.col("gh"), 1, HEAT_GROSSA)
+    )
     total_fina = fina.count()
     if total_fina:
         fina.repartition(4).foreachPartition(
             lambda linhas: escreve_celulas(
                 linhas,
                 lambda l: f"HEAT#{l['device_id']}#{l['dia']}#{l['gh_grossa']}",
-                "gh_fina",
                 f"GH{HEAT_FINA}",
                 expira_heat,
             )

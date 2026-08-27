@@ -39,6 +39,7 @@ lambdas/                 # handlers, um arquivo por função
 frontend/index.html      # dashboard
 
 build/assemble.py        # monta template.yaml a partir do que está acima
+tools/simula_posicoes.py # gera e publica massa de posição para testar
 tests/                   # testes dos handlers, sem subir nada na AWS
 ```
 
@@ -163,6 +164,29 @@ a pilha.
 
 O script vive em `glue/rollup_job.py` e entra no template pelo mesmo
 mecanismo de include das Lambdas — edite o arquivo e rode `make build`.
+
+## Massa de teste
+
+O cliente de teste do console publica uma mensagem por vez, e a 5 s duas horas
+de trabalho por trator já são 1440 fixes. `tools/simula_posicoes.py` monta a
+rota, quebra nos limites do IoT Core (500 elementos por `PutRecordBatch`,
+128 KB de payload MQTT) e publica:
+
+```bash
+# só gerar, para inspecionar antes de mandar
+python3 tools/simula_posicoes.py --saida /tmp/posicoes.jsonl
+
+# gerar e publicar
+python3 tools/simula_posicoes.py --publicar --regiao us-east-1
+```
+
+A rota não é ruído: é serpentina de passadas paralelas com manobra de
+cabeceira (onde a permanência se concentra), uma faixa repassada para a
+sobreposição aparecer, e uma parada de motor desligado — que existe para
+exercitar o teto de `dt`. Sem o teto, essa parada doaria a duração inteira
+para a célula onde o trator ficou.
+
+O padrão são 3 tratores, 2 h, 5 s: 3420 fixes em 9 mensagens.
 
 ## Rodar sob demanda
 
@@ -292,6 +316,23 @@ está na tela. Sem `Scan`, sem índice secundário.
 A precisão 9 não é arbitrária: implemento típico tem 6 a 12 m de largura, e a
 célula precisa ser menor que o implemento, senão sobreposição — que é o que o
 heatmap deveria denunciar — nunca aparece.
+
+### O trecho é distribuído entre as células que cruza
+
+Atribuir o trecho inteiro à célula do ponto inicial subestima a cobertura
+sempre que o deslocamento entre fixes for maior que a célula — e ele é: a
+7 km/h com fix a cada 5 s o trator anda **9,7 m**, contra 4,8 m de célula
+fina. O mapa sairia pontilhado, com buraco em toda célula pulada.
+
+O job amostra cada segmento a meia-célula e reparte `dt` e distância entre as
+células cruzadas, com peso. O resultado deixa de depender da taxa de reporte
+do device.
+
+**Limitação conhecida:** o que é pintado é o caminho da antena, não a faixa do
+implemento. Para 11 km percorridos isso dá ~4,7 ha (uma linha de células de
+4,8 m), enquanto um implemento de 12 m cobriria ~13 ha. Para cobertura de
+verdade — e para sobreposição virar um número confiável — o segmento
+precisaria ser espalhado também na perpendicular, pela largura do implemento.
 
 ### O valor da célula é tempo, não contagem
 
