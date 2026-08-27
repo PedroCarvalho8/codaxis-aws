@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - run: pip install cfn-lint pyyaml
+      - run: pip install cfn-lint pyyaml boto3
 
       - name: cfn-lint
         run: cfn-lint template.yaml
@@ -24,3 +24,6 @@ jobs:
 
       - name: sintaxe do job
         run: python -m py_compile rollup_job.py
+
+      - name: handler da API
+        run: python tests/test_api_handler.py

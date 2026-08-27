@@ -10,6 +10,7 @@ template.yaml         # a pilha inteira
 deployment-file.yaml  # parâmetros + tags lidos pelo Git sync
 rollup_job.py         # script do Glue Job (a pilha publica no S3)
 scripts/              # checagem de que o script embutido não divergiu
+tests/                # teste do handler da API, sem subir nada na AWS
 ```
 
 ## Vincular no console
@@ -195,6 +196,62 @@ Bucket fechado é imutável — `Cache-Control` longo e CloudFront na frente da
 API derrubam a maior parte das leituras num dashboard com vários usuários
 olhando os mesmos devices.
 
+## API de leitura
+
+HTTP API (API Gateway v2) com uma rota, servida por Lambda:
+
+```
+GET /devices/{device_id}/metrics/{metric}?from=<ISO>&to=<ISO>[&granularity=]
+```
+
+A rota espelha a chave da tabela, então cada request vira exatamente uma
+`Query` — a policy da função só concede `dynamodb:Query`, então nem por engano
+vira um `Scan`. A URL base sai no output `ApiEndpoint`.
+
+```bash
+API=$(aws cloudformation describe-stacks --stack-name <sua-pilha> \
+  --query "Stacks[0].Outputs[?OutputKey=='ApiEndpoint'].OutputValue" --output text)
+
+curl "$API/devices/sensor-teste/metrics/temperature\
+?from=2026-08-26T00:00:00Z&to=2026-08-27T00:00:00Z"
+```
+
+```json
+{
+  "device_id": "sensor-teste", "metric": "temperature",
+  "granularity": "1h", "count": 1, "truncated": false,
+  "points": [
+    { "t": "2026-08-27T02:00:00Z", "min": 23.0, "max": 24.4,
+      "avg": 23.7, "n": 3, "unit": "C" }
+  ]
+}
+```
+
+`granularity` é opcional: sem ela, a API escolhe pela extensão do range (até
+6 h → `1min`, até 30 d → `1h`, acima → `1d`), então o frontend só manda início
+e fim. Passe explicitamente para forçar.
+
+`Cache-Control` sai longo (`max-age=86400`) quando a janela pedida já fechou, e
+curto (`max-age=30`) quando alcança o presente — bucket fechado é imutável.
+Isso é o que faz um CloudFront na frente absorver a maior parte das leituras.
+
+O `truncated` avisa quando a resposta bateu no teto de 5000 pontos; um range
+tão largo deveria estar pedindo granularidade mais grossa.
+
+### Limites e o que falta
+
+**A API é aberta.** Não há autenticação: quem tiver a URL lê a telemetria de
+qualquer device. Para um teste tudo bem; antes de valer, coloque um JWT
+authorizer ou uma chave. O throttle do stage (10 req/s, burst 20) protege a
+conta de um cliente em loop, não protege o dado.
+
+`ApiCorsOrigin` está em `*` por padrão. Aponte para o domínio do frontend.
+
+`tests/test_api_handler.py` exercita o handler sem subir nada na AWS — lê o
+código de dentro do template, troca o DynamoDB por um stub e confere, entre
+outras coisas, que os prefixos de `sk` gerados batem com o formato que o Glue
+Job grava. Roda no CI junto com o `cfn-lint`.
+
 ## Partition spec do Iceberg
 
 O `AWS::Glue::Table` com `OpenTableFormatInput` cria a tabela, mas não aplica
@@ -225,8 +282,6 @@ degrada rápido conforme o histórico cresce.
 
 - **Provisionamento de devices**: certificados X.509, IoT Policy por device e
   fleet provisioning ficam numa pilha separada, com ciclo de vida próprio.
-- **API de leitura**: API Gateway + Lambda sobre a tabela de rollups. Não
-  exponha credencial AWS direto no frontend para ler DynamoDB.
 - **Tabela Iceberg de agregados**: hoje o rollup vai só para o DynamoDB. Se
   quiser histórico agregado além do TTL, adicione uma segunda tabela Iceberg
   e um `MERGE INTO` no job antes da escrita no Dynamo.

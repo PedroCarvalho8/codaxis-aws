@@ -46,6 +46,13 @@ Parameters:
     Default: 45
     Description: Retencao dos rollups no DynamoDB antes do TTL expirar o item.
 
+  ApiCorsOrigin:
+    Type: String
+    Default: '*'
+    Description: >
+      Origem aceita pelo CORS da API de leitura. '*' serve para teste; em
+      producao aponte para o dominio do frontend.
+
   FirehoseBufferSeconds:
     Type: Number
     Default: 300
@@ -823,6 +830,210 @@ Resources:
                   - dynamodb:DescribeTable
                 Resource: !GetAtt RollupTable.Arn
 
+  # ---------------------------------------------------------------------------
+  # API de leitura - HTTP API sobre a tabela de rollups
+  #
+  #   GET /devices/{device_id}/metrics/{metric}?from=...&to=...[&granularity=]
+  #
+  # A rota espelha a chave da tabela, entao cada request vira exatamente uma
+  # Query -- nunca um Scan. HTTP API em vez de REST API: ~3x mais barato por
+  # requisicao e CORS nativo, sem precisar de nada que so o REST oferece.
+  # ---------------------------------------------------------------------------
+
+  QueryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-api-query'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt QueryFunctionRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE: !Ref RollupTable
+          CORS_ORIGIN: !Ref ApiCorsOrigin
+      Code:
+        ZipFile: |
+          import json
+          import os
+          from datetime import datetime, timezone
+          from decimal import Decimal
+
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          TABELA = boto3.resource("dynamodb").Table(os.environ["TABLE"])
+          ORIGEM = os.environ["CORS_ORIGIN"]
+          TETO = 5000
+
+          # granularidade -> (range maximo em segundos, caracteres do prefixo de tempo)
+          # Espelha o formato de chave gravado pelo Glue Job:
+          #   1min aaaa-mm-ddTHH:MM | 1h aaaa-mm-ddTHH | 1d aaaa-mm-dd
+          FAIXAS = (("1min", 6 * 3600, 16), ("1h", 30 * 86400, 13), ("1d", None, 10))
+          CORTES = {g: c for g, _, c in FAIXAS}
+
+
+          def instante(texto):
+              return datetime.fromisoformat(texto.replace("Z", "+00:00"))
+
+
+          def responde(status, corpo, cache="no-store"):
+              return {
+                  "statusCode": status,
+                  "headers": {
+                      "content-type": "application/json",
+                      "access-control-allow-origin": ORIGEM,
+                      "cache-control": cache,
+                  },
+                  "body": json.dumps(corpo, default=float),
+              }
+
+
+          def handler(event, context):
+              caminho = event.get("pathParameters") or {}
+              query = event.get("queryStringParameters") or {}
+              device, metrica = caminho.get("device_id"), caminho.get("metric")
+
+              try:
+                  inicio, fim = instante(query["from"]), instante(query["to"])
+              except (KeyError, ValueError, TypeError):
+                  return responde(400, {"erro": "from e to obrigatorios, em ISO-8601 UTC"})
+              if fim <= inicio:
+                  return responde(400, {"erro": "to precisa ser maior que from"})
+
+              gran = query.get("granularity")
+              if not gran:
+                  janela = (fim - inicio).total_seconds()
+                  gran = next(g for g, teto, _ in FAIXAS if teto is None or janela <= teto)
+              if gran not in CORTES:
+                  return responde(400, {"erro": f"granularity invalida: {gran}"})
+
+              corte = CORTES[gran]
+              condicao = Key("pk").eq(f"DEV#{device}#{metrica}") & Key("sk").between(
+                  f"AGG#{gran}#{inicio.isoformat()[:corte]}",
+                  f"AGG#{gran}#{fim.isoformat()[:corte]}",
+              )
+
+              pontos, proxima = [], None
+              while len(pontos) < TETO:
+                  extra = {"ExclusiveStartKey": proxima} if proxima else {}
+                  pagina = TABELA.query(KeyConditionExpression=condicao, **extra)
+                  pontos += [
+                      {
+                          "t": item["bucket_start"],
+                          "min": item["min"],
+                          "max": item["max"],
+                          "avg": item["avg"],
+                          "n": int(item["n"]),
+                          "unit": item.get("unit") or None,
+                      }
+                      for item in pagina["Items"]
+                  ]
+                  proxima = pagina.get("LastEvaluatedKey")
+                  if not proxima:
+                      break
+
+              # Bucket fechado nao muda mais; so a janela que alcanca o presente
+              # precisa de cache curto.
+              encerrado = fim < datetime.now(timezone.utc)
+              return responde(
+                  200,
+                  {
+                      "device_id": device,
+                      "metric": metrica,
+                      "granularity": gran,
+                      "from": query["from"],
+                      "to": query["to"],
+                      "truncated": len(pontos) >= TETO,
+                      "count": len(pontos),
+                      "points": pontos,
+                  },
+                  "public, max-age=86400" if encerrado else "public, max-age=30",
+              )
+
+  QueryFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: le-rollups
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Somente Query: a API nao tem como cair num Scan da tabela.
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource: !GetAtt RollupTable.Arn
+
+  RollupApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-api'
+      Description: Serie temporal de rollups para o frontend.
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref ApiCorsOrigin
+        AllowMethods:
+          - GET
+          - OPTIONS
+        AllowHeaders:
+          - content-type
+        MaxAge: 300
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RollupApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt QueryFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  ApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'GET /devices/{device_id}/metrics/{metric}'
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref RollupApi
+      StageName: $default
+      AutoDeploy: true
+      # A tabela e PAY_PER_REQUEST: sem teto, um cliente em loop vira conta.
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+        DetailedMetricsEnabled: true
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","rota":"$context.routeKey","status":"$context.status","erroIntegracao":"$context.integration.error","ms":"$context.responseLatency"}'
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}'
+      RetentionInDays: 14
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref QueryFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
+
 Outputs:
 
   IoTRuleName:
@@ -844,3 +1055,12 @@ Outputs:
 
   DataBucket:
     Value: !Ref DataBucket
+
+  ApiEndpoint:
+    Description: Base da API de leitura consumida pelo frontend.
+    Value: !GetAtt RollupApi.ApiEndpoint
+
+  ApiExemplo:
+    Description: Chamada de exemplo (ajuste device, metrica e o intervalo).
+    Value: !Sub >-
+      ${RollupApi.ApiEndpoint}/devices/sensor-teste/metrics/temperature?from=2026-08-26T00:00:00Z&to=2026-08-27T00:00:00Z
