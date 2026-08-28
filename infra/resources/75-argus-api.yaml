@@ -1,0 +1,499 @@
+  # ---------------------------------------------------------------------------
+  # API do argus - autenticacao, frota, localizacoes e usuarios
+  #
+  # As rotas espelham o contrato OpenAPI que o webapp argus consome
+  # (github.com/PedroDaniluz/argus-webapp): /auth/*, /api/devices,
+  # /api/locations e /api/users, com os mesmos formatos de resposta.
+  # ---------------------------------------------------------------------------
+
+  # Uma UNICA policy para toda a frota, com variaveis de politica do IoT:
+  # o certificado so conecta com o client id do proprio thing e so publica
+  # nos topicos dele. Sem Subscribe nem Receive: o device e um emissor.
+  DevicePolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-device'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: iot:Connect
+            Resource: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:client/${!iot:Connection.Thing.ThingName}'
+            Condition:
+              Bool:
+                iot:Connection.Thing.IsAttached: ['true']
+          - Effect: Allow
+            Action: iot:Publish
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topic/devices/${!iot:Connection.Thing.ThingName}/telemetry'
+              - !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topic/devices/${!iot:Connection.Thing.ThingName}/position'
+              - !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/rules/${TelemetryTopicRule}'
+              - !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/rules/${PositionTopicRule}'
+
+  # Sem autocadastro: usuario nasce por POST /api/users (ADMIN) ou pela CLI.
+  # SEM DeletionPolicy Retain enquanto o ambiente e de desenvolvimento;
+  # producao deve adicionar (usuarios sao estado).
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-users'
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+      LambdaConfig:
+        PreTokenGeneration: !GetAtt PreTokenFunction.Arn
+
+  # Papeis que o webapp entende. O pre-token-generation transforma o grupo no
+  # claim 'role' do ID token; o handler de usuarios impoe ADMIN na API.
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: ADMIN
+  OperatorGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: OPERATOR
+  ViewerGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: VIEWER
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub '${ProjectName}-api'
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  PreTokenFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-pretoken'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt PreTokenRole.Arn
+      Timeout: 5
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          {{ include: lambdas/cognito_pretoken.py }}
+
+  PreTokenRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  PreTokenInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PreTokenFunction
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  # JWT authorizer nativo: o gateway valida o token do Cognito sem invocar
+  # Lambda. O accessToken devolvido pelo login e o ID TOKEN (aud = client id).
+  ArgusAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref RollupApi
+      Name: !Sub '${ProjectName}-cognito'
+      AuthorizerType: JWT
+      IdentitySource:
+        - '$request.header.Authorization'
+      JwtConfiguration:
+        Audience:
+          - !Ref UserPoolClient
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+
+  # ---- funcoes ---------------------------------------------------------------
+
+  AuthFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-argus-auth'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt AuthRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          CLIENT_ID: !Ref UserPoolClient
+      Code:
+        ZipFile: |
+          {{ include: lambdas/argus_auth.py }}
+
+  AuthRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: autentica
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: cognito-idp:InitiateAuth
+                Resource: !GetAtt UserPool.Arn
+
+  DevicesReadFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-argus-devices-read'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt DevicesReadRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE: !Ref RollupTable
+      Code:
+        ZipFile: |
+          {{ include: lambdas/argus_devices_read.py }}
+
+  DevicesReadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: le-frota
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:GetItem
+                Resource: !GetAtt RollupTable.Arn
+
+  DevicesWriteFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-argus-devices-write'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt DevicesWriteRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE: !Ref RollupTable
+          DEVICE_POLICY: !Ref DevicePolicy
+      Code:
+        ZipFile: |
+          {{ include: lambdas/argus_devices_write.py }}
+
+  DevicesWriteRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: provisiona-frota
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iot:CreateKeysAndCertificate
+                  - iot:DescribeEndpoint
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iot:CreateThing
+                  - iot:AttachThingPrincipal
+                  - iot:DetachThingPrincipal
+                  - iot:ListThingPrincipals
+                Resource: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:thing/*'
+              - Effect: Allow
+                Action:
+                  - iot:UpdateCertificate
+                  - iot:DeleteCertificate
+                  - iot:AttachPolicy
+                  - iot:DetachPolicy
+                Resource: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:cert/*'
+              - Effect: Allow
+                Action:
+                  - iot:AttachPolicy
+                  - iot:DetachPolicy
+                Resource: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:policy/${DevicePolicy}'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt RollupTable.Arn
+
+  LocationsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-argus-locations'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt DevicesReadRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE: !Ref RollupTable
+      Code:
+        ZipFile: |
+          {{ include: lambdas/argus_locations.py }}
+
+  UsersFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-argus-users'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt UsersRole.Arn
+      Timeout: 20
+      MemorySize: 256
+      Environment:
+        Variables:
+          USER_POOL: !Ref UserPool
+      Code:
+        ZipFile: |
+          {{ include: lambdas/argus_users.py }}
+
+  UsersRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: gere-usuarios
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:ListUsers
+                  - cognito-idp:AdminListGroupsForUser
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminSetUserPassword
+                  - cognito-idp:AdminAddUserToGroup
+                  - cognito-idp:AdminGetUser
+                Resource: !GetAtt UserPool.Arn
+
+  # ---- integracoes, rotas e permissoes --------------------------------------
+
+  AuthIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RollupApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AuthFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  DevicesReadIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RollupApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt DevicesReadFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  DevicesWriteIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RollupApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt DevicesWriteFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  LocationsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RollupApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt LocationsFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  UsersIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RollupApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt UsersFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  # Login e refresh sao as unicas rotas sem authorizer: e onde o token nasce.
+  LoginRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'POST /auth/login'
+      Target: !Sub 'integrations/${AuthIntegration}'
+
+  RefreshRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'POST /auth/refresh'
+      Target: !Sub 'integrations/${AuthIntegration}'
+
+  DevicesListRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'GET /api/devices'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ArgusAuthorizer
+      Target: !Sub 'integrations/${DevicesReadIntegration}'
+
+  DevicesDetailRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'GET /api/devices/{code}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ArgusAuthorizer
+      Target: !Sub 'integrations/${DevicesReadIntegration}'
+
+  DevicesCreateRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'POST /api/devices'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ArgusAuthorizer
+      Target: !Sub 'integrations/${DevicesWriteIntegration}'
+
+  DevicesRevokeRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'DELETE /api/devices/{code}/key'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ArgusAuthorizer
+      Target: !Sub 'integrations/${DevicesWriteIntegration}'
+
+  LocationsHistoryRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'GET /api/locations'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ArgusAuthorizer
+      Target: !Sub 'integrations/${LocationsIntegration}'
+
+  LocationsLatestRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'GET /api/locations/latest'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ArgusAuthorizer
+      Target: !Sub 'integrations/${LocationsIntegration}'
+
+  UsersListRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'GET /api/users'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ArgusAuthorizer
+      Target: !Sub 'integrations/${UsersIntegration}'
+
+  UsersCreateRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'POST /api/users'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ArgusAuthorizer
+      Target: !Sub 'integrations/${UsersIntegration}'
+
+  AuthInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
+
+  DevicesReadInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DevicesReadFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
+
+  DevicesWriteInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DevicesWriteFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
+
+  LocationsInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LocationsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
+
+  UsersInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UsersFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'

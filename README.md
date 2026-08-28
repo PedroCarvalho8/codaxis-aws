@@ -1,10 +1,10 @@
 # Pipeline de ingestão IoT — IoT Core → Firehose → Iceberg → DynamoDB
 
 Backend de telemetria de campo: recepção (MQTT com certificado X.509 por
-device), armazenamento (Iceberg bruto + DynamoDB agregado), tratamento (Glue
-Job de rollups e heatmap) e APIs — de consulta e de gestão da frota. **Sem
-frontend neste repositório**: a API é o produto; qualquer UI consome as rotas
-daqui de onde estiver.
+device), armazenamento (Iceberg bruto + DynamoDB quente), tratamento (Glue
+Job de rollups e heatmap) e a API que o webapp
+[argus](https://github.com/PedroDaniluz/argus-webapp) consome — mesmo
+contrato OpenAPI: `/auth/*`, `/api/devices`, `/api/locations`, `/api/users`.
 
 Pilha CloudFormation vinculada a este repositório via **Git sync**: a cada
 push nesta branch o serviço reaplica a pilha a partir de `template.yaml`,
@@ -31,7 +31,7 @@ infra/                   # fontes do template
     50-dynamodb.yaml
     60-glue-job.yaml
     70-api.yaml
-    75-fleet-api.yaml
+    75-argus-api.yaml
 
 glue/rollup_job.py       # script do Glue Job
 lambdas/                 # handlers, um arquivo por função
@@ -41,8 +41,12 @@ lambdas/                 # handlers, um arquivo por função
   api_query.py
   api_catalog.py
   api_heatmap.py
-  fleet_devices_read.py
-  fleet_devices_write.py
+  argus_auth.py
+  argus_devices_read.py
+  argus_devices_write.py
+  argus_locations.py
+  argus_users.py
+  cognito_pretoken.py
 
 build/assemble.py        # monta template.yaml a partir do que está acima
 tools/simula_posicoes.py # gera e publica massa de posição para testar
@@ -386,25 +390,28 @@ olhando os mesmos devices.
 
 HTTP API (API Gateway v2), duas rotas, cada uma com sua Lambda:
 
-Consulta (abertas — proteja antes de expor publicamente):
+As rotas espelham o contrato que o argus gera via orval:
 
 ```
-GET /devices
-GET /devices/{device_id}/metrics/{metric}?from=<ISO>&to=<ISO>[&granularity=]
-GET /devices/{device_id}/heatmap?from=<AAAA-MM-DD>&to=<AAAA-MM-DD>[&cell=]
+POST   /auth/login      {email, password}   ->  {accessToken, refreshToken, expiresIn}
+POST   /auth/refresh    {refreshToken}
+
+GET    /api/devices                             DeviceResponse[]
+GET    /api/devices/{code}
+POST   /api/devices     {code, label}       ->  {device, key}   (key: uma vez)
+DELETE /api/devices/{code}/key                  revoga os certificados
+
+GET    /api/locations/latest                    LocationResponse[]
+GET    /api/locations?device&from&to&limit      LocationPage (keyset por `to`)
+
+GET    /api/users                               (apenas ADMIN)
+POST   /api/users       {email, password, name, role}
 ```
 
-Gestão da frota (exigem token do Cognito; ver **API de gestão** abaixo):
-
-```
-GET    /fleet/devices                                  lista os things
-GET    /fleet/devices/{id}                             detalhe + certificados
-POST   /fleet/devices          {"device_id": "..."}    cria thing + certificado
-POST   /fleet/devices/{id}/certificates                rotaciona (novo cert)
-PATCH  /fleet/devices/{id}/certificates/{cid}          {"status": ACTIVE|INACTIVE}
-DELETE /fleet/devices/{id}/certificates/{cid}          revoga e apaga o cert
-DELETE /fleet/devices/{id}                             descomissiona o device
-```
+Tudo menos `/auth/*` exige `Authorization: Bearer <accessToken>`. O
+`accessToken` é o **ID token** do Cognito — é ele que carrega `email` e o
+claim `role` que o webapp decodifica; o access token do Cognito não aceita
+claim custom sem feature plan pago.
 
 Nenhuma das duas faz `Scan` — a policy das funções só concede
 `dynamodb:Query`, então isso não depende de disciplina de quem edita o código.
@@ -485,103 +492,66 @@ de propósito: o que interessa testar é o artefato que a pilha vai implantar.
 Troca o DynamoDB por um stub e confere, entre outras coisas, que os prefixos de
 `sk` gerados batem com o formato que o Glue Job grava.
 
-## API de gestão
+## Autenticação e papéis
 
-### Autenticação — Cognito User Pool
+Cognito User Pool com três grupos — `ADMIN`, `OPERATOR`, `VIEWER` — e um
+pre-token-generation que transforma o grupo no claim `role` do ID token.
+`/api/users` impõe `ADMIN` no handler; o restante, qualquer papel autenticado.
+O JWT authorizer nativo do gateway valida o token antes de invocar Lambda.
 
-As rotas `/fleet/*` passam pelo **JWT authorizer nativo** do HTTP API: o
-gateway valida assinatura, expiração e audience do token do Cognito antes de
-invocar qualquer Lambda. Sem token, a resposta é 401 e o código de negócio nem
-executa — não há authorizer nosso para manter.
-
-Neste momento a autorização é deliberadamente rasa: **qualquer usuário do
-pool gere a frota**. Papéis (`cognito:groups` no token, checados no handler)
-entram quando houver mais de um perfil de acesso.
-
-O pool não tem autocadastro — usuário nasce pela CLI, nunca sozinho:
+Bootstrap do primeiro admin (o pool não tem autocadastro):
 
 ```bash
-POOL=$(aws cloudformation describe-stacks --stack-name <sua-pilha> \
-  --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
-CLIENT=$(aws cloudformation describe-stacks --stack-name <sua-pilha> \
-  --query "Stacks[0].Outputs[?OutputKey=='UserPoolClientId'].OutputValue" --output text)
+POOL=...; CLIENT=...   # outputs UserPoolId e UserPoolClientId
 
-aws cognito-idp admin-create-user \
-  --user-pool-id $POOL --username voce@exemplo.com --message-action SUPPRESS
-aws cognito-idp admin-set-user-password \
-  --user-pool-id $POOL --username voce@exemplo.com \
-  --password 'SuaSenhaForte-12+' --permanent
+aws cognito-idp admin-create-user --user-pool-id $POOL \
+  --username voce@exemplo.com --message-action SUPPRESS \
+  --user-attributes Name=email,Value=voce@exemplo.com Name=name,Value="Seu Nome"
+aws cognito-idp admin-set-user-password --user-pool-id $POOL \
+  --username voce@exemplo.com --password 'SuaSenhaForte-12+' --permanent
+aws cognito-idp admin-add-user-to-group --user-pool-id $POOL \
+  --username voce@exemplo.com --group-name ADMIN
 ```
 
-Token (vale 1 h; o `RefreshToken` renova sem senha):
+Os próximos usuários nascem pelo próprio webapp (`POST /api/users`).
 
-```bash
-TOKEN=$(aws cognito-idp initiate-auth \
-  --auth-flow USER_PASSWORD_AUTH --client-id $CLIENT \
-  --auth-parameters USERNAME=voce@exemplo.com,PASSWORD='SuaSenhaForte-12+' \
-  --query 'AuthenticationResult.IdToken' --output text)
-```
+O User Pool **não tem** `DeletionPolicy: Retain` de propósito enquanto o
+ambiente é de desenvolvimento; produção deve adicionar.
 
-O User Pool **não tem** `DeletionPolicy: Retain` de propósito: enquanto o
-ambiente é de desenvolvimento, usuários morrem com a pilha e a recriação não
-esbarra no `ResourceExistenceCheck`. Antes de valer em produção, adicione
-`Retain` — e releia a seção de recursos retidos.
+## Devices e certificados
 
-### Provisionar um device
+`POST /api/devices {code, label}` cria o thing, emite o certificado X.509 e
+devolve `key` **uma única vez** — um bundle com a chave privada, o certificado
+e o endpoint MQTT, pronto para gravar no firmware. Metadados (label,
+created_at, active) vivem no DynamoDB, não em atributo de thing — atributo de
+thing não aceita espaço, e rótulo humano tem espaço.
 
-```bash
-API=...
+Todos os certificados compartilham **uma** política com variáveis de política
+do IoT: o certificado só conecta com o client id do próprio thing e só publica
+nos tópicos dele (`devices/<code>/telemetry|position` e basic ingest). Sem
+`Subscribe`, sem `Receive`.
 
-curl -s -X POST "$API/fleet/devices" \
-  -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
-  -d '{"device_id": "trator-07"}'
-```
+`DELETE /api/devices/{code}/key` desativa o certificado **antes** de desanexar
+e apagar — a conexão cai mesmo se um passo seguinte falhar — e marca o device
+como revogado. Antes de deletar a **pilha**, revogue os devices: a política da
+frota não pode ser removida com certificado anexado.
 
-```json
-{
-  "device_id": "trator-07",
-  "certificate_id": "abc123...",
-  "certificate_pem": "-----BEGIN CERTIFICATE-----...",
-  "private_key": "-----BEGIN RSA PRIVATE KEY-----...",
-  "endpoint": "xxxx-ats.iot.us-east-1.amazonaws.com",
-  "topics": {"telemetry": "devices/trator-07/telemetry",
-             "position": "devices/trator-07/position"}
-}
-```
+## Localizações em tempo quase real
 
-**A chave privada aparece só nessa resposta.** É gerada pela AWS e não fica
-armazenada em lugar nenhum — grave-a no device na hora. Perdeu, não recupera:
-rotaciona (`POST .../certificates`) e revoga a antiga.
+A transform de posição do Firehose, além de repassar ao Iceberg, grava no
+DynamoDB o rastro (`TRACK#<code>`, TTL de `HotStoreTtlDays`) e a última
+posição (`LATEST`) — é o que `/api/locations` serve com latência de ~1 min
+(buffer da Lambda no Firehose), sem esperar o job horário. O Iceberg continua
+sendo a fonte histórica completa.
 
-### Privilégio mínimo por construção
+`GET /api/locations` pagina por keyset: `to` é **exclusivo** e cada página
+devolve `nextCursor` para ser repassado como `to` — o formato que o
+`useInfiniteQuery` gerado no argus espera. `speedMps` sai convertido do `speed`
+em km/h do contrato MQTT.
 
-Todos os certificados compartilham **uma** política, com variáveis de
-política do IoT:
-
-```
-iot:Connect   client/${iot:Connection.Thing.ThingName}   (thing anexado)
-iot:Publish   topic/devices/${iot:Connection.Thing.ThingName}/telemetry
-              topic/devices/${iot:Connection.Thing.ThingName}/position
-              topic/$aws/rules/<regra de telemetria|posição>   (basic ingest)
-```
-
-A variável resolve para o thing anexado ao certificado na conexão: o
-certificado do trator-07 só conecta como `trator-07` e só publica nos tópicos
-do trator-07 — mesmo vazado, não publica no lugar de outro device. Não há
-`Subscribe` nem `Receive`: o device desta pilha é um emissor; se um dia
-precisar receber comando, a permissão nasce aí.
-
-### Ciclo de vida do certificado
-
-Rotação sem janela: emita o novo (`POST .../certificates`), grave no device,
-confirme que conectou, e só então `PATCH` o antigo para `INACTIVE` — os dois
-coexistem ativos durante a troca. `DELETE` do certificado desativa **antes**
-de desanexar e apagar, então a conexão cai mesmo se um passo seguinte falhar.
-`DELETE` do device revoga todos os certificados e apaga o thing por último.
-
-Antes de deletar a **pilha**: descomissione os devices. A política da frota
-não pode ser removida enquanto houver certificado anexado, e o delete da
-pilha falharia nela.
+O que a pilha **não** serve ao argus: `GET /api/locations/stream` (SSE). O
+HTTP API não sustenta resposta em streaming de Lambda; o PR de integração no
+argus adiciona fallback de polling sobre `/api/locations/latest`.
 
 ## Partition spec do Iceberg
 
@@ -624,8 +594,12 @@ degrada rápido conforme o histórico cresce.
 
 - **Provisionamento de devices**: certificados X.509, IoT Policy por device e
   fleet provisioning ficam numa pilha separada, com ciclo de vida próprio.
-- **Frontend**: removido deste repositório de propósito. A API serve
-  qualquer UI externa; `ApiCorsOrigin` restringe a origem quando ela existir.
+- **Frontend**: é o [argus-webapp](https://github.com/PedroDaniluz/argus-webapp),
+  em repositório próprio. `API_URL` de lá aponta para o output `ApiEndpoint`
+  daqui.
+- **SSE de localizações**: exige runtime com resposta em streaming (ALB +
+  Lambda streaming, ou um serviço); entra junto com a migração para packaging
+  real.
 - **Heatmap de frota**: hoje a partição é por trator. Um agregado por fazenda
   seria uma partição `HEAT#FLEET#<dia>` escrita pelo mesmo job.
 - **Tabela Iceberg de agregados**: hoje o rollup vai só para o DynamoDB. Se

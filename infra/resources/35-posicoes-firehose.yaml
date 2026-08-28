@@ -12,12 +12,42 @@
       FunctionName: !Sub '${ProjectName}-position-transform'
       Runtime: python3.12
       Handler: index.handler
-      Role: !GetAtt TransformFunctionRole.Arn
+      Role: !GetAtt PositionTransformRole.Arn
       Timeout: 60
       MemorySize: 256
+      Environment:
+        Variables:
+          TABLE: !Ref RollupTable
+          TTL_DAYS: !Ref HotStoreTtlDays
       Code:
         ZipFile: |
           {{ include: lambdas/firehose_position_transform.py }}
+
+  # Role propria porque, alem de transformar, esta funcao grava o rastro
+  # (TRACK) e a ultima posicao (LATEST) no DynamoDB em tempo quase real --
+  # e o que alimenta /api/locations sem esperar o job horario.
+  PositionTransformRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: grava-rastro
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt RollupTable.Arn
 
   PositionLogGroup:
     Type: AWS::Logs::LogGroup

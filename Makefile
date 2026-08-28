@@ -11,8 +11,7 @@ check:  ## nao altera nada; e o que o CI roda
 	cfn-lint template.yaml
 	python3 -m compileall -q glue lambdas
 	python3 tests/test_geohash.py
-	python3 tests/test_api_handler.py
-	python3 tests/test_fleet_handlers.py
+	python3 tests/test_argus_handlers.py
 
 test: check
 

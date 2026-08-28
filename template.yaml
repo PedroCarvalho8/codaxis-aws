@@ -525,14 +525,24 @@ Resources:
       FunctionName: !Sub '${ProjectName}-position-transform'
       Runtime: python3.12
       Handler: index.handler
-      Role: !GetAtt TransformFunctionRole.Arn
+      Role: !GetAtt PositionTransformRole.Arn
       Timeout: 60
       MemorySize: 256
+      Environment:
+        Variables:
+          TABLE: !Ref RollupTable
+          TTL_DAYS: !Ref HotStoreTtlDays
       Code:
         ZipFile: |
           import base64
           import json
-          from datetime import datetime, timezone
+          import os
+          from datetime import datetime, timedelta, timezone
+
+          import boto3
+
+          TABELA = boto3.resource("dynamodb").Table(os.environ["TABLE"])
+          TTL_DIAS = int(os.environ["TTL_DAYS"])
 
           # lat/lon sao obrigatorios e precisam vir PAREADOS na mesma leitura: distancia,
           # velocidade e a propria celula do mapa dependem do par, e nenhum deles se
@@ -541,9 +551,43 @@ Resources:
           OPCIONAIS_FLOAT = ("speed", "heading", "altitude")
 
 
+          def grava_dynamo(validos):
+              """Rastro (TRACK) e ultima posicao (LATEST) em tempo quase real.
+
+              O Iceberg continua sendo a fonte historica completa; estas linhas servem
+              a API do argus (latest e paginacao do track) sem esperar o job horario.
+              Escrita idempotente por (pk, sk): retry do Firehose sobrescreve igual.
+              """
+              from decimal import Decimal
+              expira = int((datetime.now(timezone.utc)
+                            + timedelta(days=TTL_DIAS)).timestamp())
+              ultimos = {}
+              with TABELA.batch_writer(overwrite_by_pkeys=["pk", "sk"]) as lote:
+                  for p in validos:
+                      item = {"ts": p["event_time"],
+                              "lat": Decimal(str(p["lat"])),
+                              "lon": Decimal(str(p["lon"])),
+                              "received_at": p["ingested_at"][:19] + "Z",
+                              "expires_at": expira}
+                      for campo in ("speed", "heading"):
+                          if p.get(campo) is not None:
+                              item[campo] = Decimal(str(p[campo]))
+                      lote.put_item(Item=dict(
+                          item, pk=f"TRACK#{p['device_id']}",
+                          sk=f"{p['event_time']}#{int(p.get('seq') or 0):06d}"))
+                      atual = ultimos.get(p["device_id"])
+                      if not atual or p["event_time"] > atual["ts"]:
+                          ultimos[p["device_id"]] = item
+                  for device, item in ultimos.items():
+                      lote.put_item(Item=dict(
+                          item, pk=f"DEV#{device}#position", sk="LATEST",
+                          at=item["ts"]))
+
+
           def handler(event, context):
               now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
               out = []
+              validos = []
               for rec in event["records"]:
                   try:
                       payload = json.loads(base64.b64decode(rec["data"]))
@@ -574,10 +618,39 @@ Resources:
                       out.append({"recordId": rec["recordId"],
                                   "result": "Ok",
                                   "data": data})
+                      validos.append(payload)
                   except Exception:
                       out.append({"recordId": rec["recordId"],
                                   "result": "ProcessingFailed"})
+              if validos:
+                  grava_dynamo(validos)
               return {"records": out}
+
+  # Role propria porque, alem de transformar, esta funcao grava o rastro
+  # (TRACK) e a ultima posicao (LATEST) no DynamoDB em tempo quase real --
+  # e o que alimenta /api/locations sem esperar o job horario.
+  PositionTransformRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: grava-rastro
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt RollupTable.Arn
 
   PositionLogGroup:
     Type: AWS::Logs::LogGroup
@@ -1493,147 +1566,11 @@ Resources:
                 Resource: !GetAtt RollupTable.Arn
 
   # ---------------------------------------------------------------------------
-  # API de leitura - HTTP API sobre a tabela de rollups
+  # HTTP API - gateway compartilhado pelas rotas do argus
   #
-  #   GET /devices/{device_id}/metrics/{metric}?from=...&to=...[&granularity=]
-  #
-  # A rota espelha a chave da tabela, entao cada request vira exatamente uma
-  # Query -- nunca um Scan. HTTP API em vez de REST API: ~3x mais barato por
-  # requisicao e CORS nativo, sem precisar de nada que so o REST oferece.
+  # As rotas, funcoes e o authorizer vivem em 75-argus-api.yaml. Aqui fica so
+  # o chassi: api, stage com throttle e access log.
   # ---------------------------------------------------------------------------
-
-  QueryFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub '${ProjectName}-api-query'
-      Runtime: python3.12
-      Handler: index.handler
-      Role: !GetAtt QueryFunctionRole.Arn
-      Timeout: 15
-      MemorySize: 256
-      Environment:
-        Variables:
-          TABLE: !Ref RollupTable
-          CORS_ORIGIN: !Ref ApiCorsOrigin
-      Code:
-        ZipFile: |
-          import json
-          import os
-          from datetime import datetime, timezone
-          from decimal import Decimal
-
-          import boto3
-          from boto3.dynamodb.conditions import Key
-
-          TABELA = boto3.resource("dynamodb").Table(os.environ["TABLE"])
-          ORIGEM = os.environ["CORS_ORIGIN"]
-          TETO = 5000
-
-          # granularidade -> (range maximo em segundos, caracteres do prefixo de tempo)
-          # Espelha o formato de chave gravado pelo Glue Job:
-          #   1min aaaa-mm-ddTHH:MM | 1h aaaa-mm-ddTHH | 1d aaaa-mm-dd
-          FAIXAS = (("1min", 6 * 3600, 16), ("1h", 30 * 86400, 13), ("1d", None, 10))
-          CORTES = {g: c for g, _, c in FAIXAS}
-
-
-          def instante(texto):
-              return datetime.fromisoformat(texto.replace("Z", "+00:00"))
-
-
-          def responde(status, corpo, cache="no-store"):
-              return {
-                  "statusCode": status,
-                  "headers": {
-                      "content-type": "application/json",
-                      "access-control-allow-origin": ORIGEM,
-                      "cache-control": cache,
-                  },
-                  "body": json.dumps(corpo, default=float),
-              }
-
-
-          def handler(event, context):
-              caminho = event.get("pathParameters") or {}
-              query = event.get("queryStringParameters") or {}
-              device, metrica = caminho.get("device_id"), caminho.get("metric")
-
-              try:
-                  inicio, fim = instante(query["from"]), instante(query["to"])
-              except (KeyError, ValueError, TypeError):
-                  return responde(400, {"erro": "from e to obrigatorios, em ISO-8601 UTC"})
-              if fim <= inicio:
-                  return responde(400, {"erro": "to precisa ser maior que from"})
-
-              gran = query.get("granularity")
-              if not gran:
-                  janela = (fim - inicio).total_seconds()
-                  gran = next(g for g, teto, _ in FAIXAS if teto is None or janela <= teto)
-              if gran not in CORTES:
-                  return responde(400, {"erro": f"granularity invalida: {gran}"})
-
-              corte = CORTES[gran]
-              condicao = Key("pk").eq(f"DEV#{device}#{metrica}") & Key("sk").between(
-                  f"AGG#{gran}#{inicio.isoformat()[:corte]}",
-                  f"AGG#{gran}#{fim.isoformat()[:corte]}",
-              )
-
-              pontos, proxima = [], None
-              while len(pontos) < TETO:
-                  extra = {"ExclusiveStartKey": proxima} if proxima else {}
-                  pagina = TABELA.query(KeyConditionExpression=condicao, **extra)
-                  pontos += [
-                      {
-                          "t": item["bucket_start"],
-                          "min": item["min"],
-                          "max": item["max"],
-                          "avg": item["avg"],
-                          "n": int(item["n"]),
-                          "unit": item.get("unit") or None,
-                      }
-                      for item in pagina["Items"]
-                  ]
-                  proxima = pagina.get("LastEvaluatedKey")
-                  if not proxima:
-                      break
-
-              # Bucket fechado nao muda mais; so a janela que alcanca o presente
-              # precisa de cache curto.
-              encerrado = fim < datetime.now(timezone.utc)
-              return responde(
-                  200,
-                  {
-                      "device_id": device,
-                      "metric": metrica,
-                      "granularity": gran,
-                      "from": query["from"],
-                      "to": query["to"],
-                      "truncated": len(pontos) >= TETO,
-                      "count": len(pontos),
-                      "points": pontos,
-                  },
-                  "public, max-age=86400" if encerrado else "public, max-age=30",
-              )
-  QueryFunctionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
-      Policies:
-        - PolicyName: le-rollups
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              # Somente Query: a API nao tem como cair num Scan da tabela.
-              - Effect: Allow
-                Action: dynamodb:Query
-                Resource: !GetAtt RollupTable.Arn
 
   RollupApi:
     Type: AWS::ApiGatewayV2::Api
@@ -1650,21 +1587,6 @@ Resources:
         AllowHeaders:
           - content-type
         MaxAge: 300
-
-  ApiIntegration:
-    Type: AWS::ApiGatewayV2::Integration
-    Properties:
-      ApiId: !Ref RollupApi
-      IntegrationType: AWS_PROXY
-      IntegrationUri: !GetAtt QueryFunction.Arn
-      PayloadFormatVersion: '2.0'
-
-  ApiRoute:
-    Type: AWS::ApiGatewayV2::Route
-    Properties:
-      ApiId: !Ref RollupApi
-      RouteKey: 'GET /devices/{device_id}/metrics/{metric}'
-      Target: !Sub 'integrations/${ApiIntegration}'
 
   ApiStage:
     Type: AWS::ApiGatewayV2::Stage
@@ -1687,269 +1609,17 @@ Resources:
       LogGroupName: !Sub '/aws/apigateway/${ProjectName}'
       RetentionInDays: 14
 
-  # Listagem de dispositivos. Existe porque o frontend precisa descobrir o
-  # que consultar; sem o item de catalogo isso seria um Scan.
-  CatalogFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub '${ProjectName}-api-catalog'
-      Runtime: python3.12
-      Handler: index.handler
-      Role: !GetAtt QueryFunctionRole.Arn
-      Timeout: 15
-      MemorySize: 256
-      Environment:
-        Variables:
-          TABLE: !Ref RollupTable
-          CORS_ORIGIN: !Ref ApiCorsOrigin
-      Code:
-        ZipFile: |
-          import json
-          import os
-          from collections import defaultdict
-
-          import boto3
-          from boto3.dynamodb.conditions import Key
-
-          TABELA = boto3.resource("dynamodb").Table(os.environ["TABLE"])
-          ORIGEM = os.environ["CORS_ORIGIN"]
-
-
-          def handler(event, context):
-              # O Glue Job mantem um item por (device, metrica) sob pk = "CATALOG".
-              # Sem ele, listar dispositivos exigiria um Scan da tabela inteira.
-              dispositivos = defaultdict(list)
-              proxima = None
-              while True:
-                  extra = {"ExclusiveStartKey": proxima} if proxima else {}
-                  pagina = TABELA.query(
-                      KeyConditionExpression=Key("pk").eq("CATALOG"), **extra
-                  )
-                  for item in pagina["Items"]:
-                      dispositivos[item["device_id"]].append({
-                          "metric": item["metric"],
-                          "unit": item.get("unit") or None,
-                          "last_seen": item.get("last_seen"),
-                      })
-                  proxima = pagina.get("LastEvaluatedKey")
-                  if not proxima:
-                      break
-
-              corpo = {
-                  "count": len(dispositivos),
-                  "devices": [
-                      {
-                          "device_id": device,
-                          "metrics": sorted(metricas, key=lambda m: m["metric"]),
-                      }
-                      for device, metricas in sorted(dispositivos.items())
-                  ],
-              }
-              return {
-                  "statusCode": 200,
-                  "headers": {
-                      "content-type": "application/json",
-                      "access-control-allow-origin": ORIGEM,
-                      "cache-control": "public, max-age=60",
-                  },
-                  "body": json.dumps(corpo),
-              }
-  CatalogIntegration:
-    Type: AWS::ApiGatewayV2::Integration
-    Properties:
-      ApiId: !Ref RollupApi
-      IntegrationType: AWS_PROXY
-      IntegrationUri: !GetAtt CatalogFunction.Arn
-      PayloadFormatVersion: '2.0'
-
-  CatalogRoute:
-    Type: AWS::ApiGatewayV2::Route
-    Properties:
-      ApiId: !Ref RollupApi
-      RouteKey: 'GET /devices'
-      Target: !Sub 'integrations/${CatalogIntegration}'
-
-  CatalogInvokePermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref CatalogFunction
-      Action: lambda:InvokeFunction
-      Principal: apigateway.amazonaws.com
-      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
-
-  # Heatmap: celulas de geohash com permanencia por celula.
-  HeatmapFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub '${ProjectName}-api-heatmap'
-      Runtime: python3.12
-      Handler: index.handler
-      Role: !GetAtt QueryFunctionRole.Arn
-      Timeout: 25
-      MemorySize: 512
-      Environment:
-        Variables:
-          TABLE: !Ref RollupTable
-          CORS_ORIGIN: !Ref ApiCorsOrigin
-      Code:
-        ZipFile: |
-          import json
-          import os
-
-          import boto3
-          from boto3.dynamodb.conditions import Key
-
-          TABELA = boto3.resource("dynamodb").Table(os.environ["TABLE"])
-          ORIGEM = os.environ["CORS_ORIGIN"]
-          TETO = 20000
-          DIAS_MAX = 31
-
-          # Tamanho da celula em graus, derivado da precisao: p caracteres = 5p bits,
-          # repartidos entre longitude (os impares) e latitude. Vai na resposta para o
-          # cliente desenhar o retangulo sem precisar decodificar geohash.
-          def tamanho_celula(precisao):
-              bits = 5 * precisao
-              bits_lon = (bits + 1) // 2
-              bits_lat = bits // 2
-              return 180.0 / (2 ** bits_lat), 360.0 / (2 ** bits_lon)
-
-
-          def responde(status, corpo, cache="no-store"):
-              return {
-                  "statusCode": status,
-                  "headers": {
-                      "content-type": "application/json",
-                      "access-control-allow-origin": ORIGEM,
-                      "cache-control": cache,
-                  },
-                  "body": json.dumps(corpo, default=float),
-              }
-
-
-          def dias_entre(inicio, fim):
-              from datetime import date, timedelta
-              a = date.fromisoformat(inicio)
-              b = date.fromisoformat(fim)
-              if b < a:
-                  return None
-              saida, atual = [], a
-              while atual <= b and len(saida) <= DIAS_MAX:
-                  saida.append(atual.isoformat())
-                  atual += timedelta(days=1)
-              return saida
-
-
-          def handler(event, context):
-              caminho = event.get("pathParameters") or {}
-              query = event.get("queryStringParameters") or {}
-              device = caminho.get("device_id")
-
-              try:
-                  dias = dias_entre(query["from"], query["to"])
-              except (KeyError, ValueError, TypeError):
-                  return responde(400, {"erro": "from e to obrigatorios, em AAAA-MM-DD"})
-              if dias is None:
-                  return responde(400, {"erro": "to precisa ser maior ou igual a from"})
-              if len(dias) > DIAS_MAX:
-                  return responde(400, {"erro": f"intervalo maior que {DIAS_MAX} dias"})
-
-              # A celula grossa e a particao da fina: o cliente manda a celula que esta
-              # no viewport e recebe so o detalhe dela, em vez do dia inteiro a 5 m.
-              celula = query.get("cell")
-              precisao = 9 if celula else 7
-              prefixo = f"GH{precisao}"
-
-              celulas = {}
-              truncado = False
-              for dia in dias:
-                  pk = f"HEAT#{device}#{dia}" + (f"#{celula}" if celula else "")
-                  proxima = None
-                  while True:
-                      extra = {"ExclusiveStartKey": proxima} if proxima else {}
-                      pagina = TABELA.query(
-                          KeyConditionExpression=(
-                              Key("pk").eq(pk) & Key("sk").begins_with(prefixo + "#")
-                          ),
-                          **extra,
-                      )
-                      for item in pagina["Items"]:
-                          # Somar entre dias: a mesma celula reaparece a cada passagem.
-                          chave = item["gh"]
-                          acumulado = celulas.setdefault(
-                              chave,
-                              {"gh": chave, "lat": item["lat"], "lon": item["lon"],
-                               "secs": 0, "dist_m": 0, "n": 0},
-                          )
-                          acumulado["secs"] += int(item["secs"])
-                          acumulado["dist_m"] += float(item["dist_m"])
-                          acumulado["n"] += int(item["n"])
-                      proxima = pagina.get("LastEvaluatedKey")
-                      if not proxima or len(celulas) >= TETO:
-                          truncado = truncado or bool(proxima)
-                          break
-
-              d_lat, d_lon = tamanho_celula(precisao)
-              return responde(
-                  200,
-                  {
-                      "device_id": device,
-                      "precision": precisao,
-                      "cell": celula,
-                      "from": query["from"],
-                      "to": query["to"],
-                      "cellSize": {"lat": d_lat, "lon": d_lon},
-                      "truncated": truncado,
-                      "count": len(celulas),
-                      "cells": sorted(celulas.values(), key=lambda c: c["gh"]),
-                  },
-                  "public, max-age=300",
-              )
-
-  HeatmapIntegration:
-    Type: AWS::ApiGatewayV2::Integration
-    Properties:
-      ApiId: !Ref RollupApi
-      IntegrationType: AWS_PROXY
-      IntegrationUri: !GetAtt HeatmapFunction.Arn
-      PayloadFormatVersion: '2.0'
-
-  HeatmapRoute:
-    Type: AWS::ApiGatewayV2::Route
-    Properties:
-      ApiId: !Ref RollupApi
-      RouteKey: 'GET /devices/{device_id}/heatmap'
-      Target: !Sub 'integrations/${HeatmapIntegration}'
-
-  HeatmapInvokePermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref HeatmapFunction
-      Action: lambda:InvokeFunction
-      Principal: apigateway.amazonaws.com
-      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
-
-  ApiInvokePermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref QueryFunction
-      Action: lambda:InvokeFunction
-      Principal: apigateway.amazonaws.com
-      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
-
   # ---------------------------------------------------------------------------
-  # Gestao da frota - provisionamento no IoT Core via API, com Cognito
+  # API do argus - autenticacao, frota, localizacoes e usuarios
   #
+  # As rotas espelham o contrato OpenAPI que o webapp argus consome
+  # (github.com/PedroDaniluz/argus-webapp): /auth/*, /api/devices,
+  # /api/locations e /api/users, com os mesmos formatos de resposta.
+  # ---------------------------------------------------------------------------
+
   # Uma UNICA policy para toda a frota, com variaveis de politica do IoT:
-  # ${iot:Connection.Thing.ThingName} resolve para o thing anexado ao
-  # certificado na conexao. O certificado do trator-07 so conecta como
-  # trator-07 e so publica nos topicos do trator-07 -- sem uma policy por
-  # device para gerenciar, e sem como um device publicar no lugar de outro.
-  #
-  # Privilegio minimo de verdade: nao ha Subscribe nem Receive. O device desta
-  # pilha e um emissor de telemetria; se um dia precisar receber comando, a
-  # permissao nasce ai, nao antes.
-  # ---------------------------------------------------------------------------
-
+  # o certificado so conecta com o client id do proprio thing e so publica
+  # nos topicos dele. Sem Subscribe nem Receive: o device e um emissor.
   DevicePolicy:
     Type: AWS::IoT::Policy
     Properties:
@@ -1968,225 +1638,12 @@ Resources:
             Resource:
               - !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topic/devices/${!iot:Connection.Thing.ThingName}/telemetry'
               - !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topic/devices/${!iot:Connection.Thing.ThingName}/position'
-              # Basic ingest: publicar direto no Rules Engine pula o broker e
-              # a cobranca de mensageria. O conteudo continua carregando o
-              # device_id, e a chave e o certificado continuam por device.
               - !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/rules/${TelemetryTopicRule}'
               - !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/rules/${PositionTopicRule}'
 
-  # Leitura da frota: listar e inspecionar devices e certificados.
-  # (Rotas protegidas pelo JWT do Cognito -- ver FleetAuthorizer.)
-  FleetReadFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub '${ProjectName}-fleet-read'
-      Runtime: python3.12
-      Handler: index.handler
-      Role: !GetAtt FleetReadRole.Arn
-      Timeout: 15
-      MemorySize: 256
-      Code:
-        ZipFile: |
-          import json
-
-          import boto3
-
-          iot = boto3.client("iot")
-          # Autenticacao no JWT authorizer nativo do gateway (Cognito User Pool):
-          # requisicao sem token valido nem chega a invocar esta funcao.
-          _cache = {}
-
-
-          def resposta(status, corpo):
-              return {
-                  "statusCode": status,
-                  "headers": {"content-type": "application/json",
-                              "cache-control": "no-store"},
-                  "body": json.dumps(corpo),
-              }
-
-
-          def endpoint_mqtt():
-              if "ep" not in _cache:
-                  _cache["ep"] = iot.describe_endpoint(
-                      endpointType="iot:Data-ATS"
-                  )["endpointAddress"]
-              return _cache["ep"]
-
-
-          def certificados_de(nome):
-              principais = iot.list_thing_principals(thingName=nome)["principals"]
-              saida = []
-              for arn in principais:
-                  cert_id = arn.split("/")[-1]
-                  desc = iot.describe_certificate(
-                      certificateId=cert_id
-                  )["certificateDescription"]
-                  saida.append({
-                      "certificate_id": cert_id,
-                      "status": desc["status"],
-                      "created_at": desc["creationDate"].strftime("%Y-%m-%dT%H:%M:%SZ"),
-                  })
-              return saida
-
-
-          def handler(event, context):
-              rota = event.get("routeKey", "")
-              caminho = event.get("pathParameters") or {}
-              consulta = event.get("queryStringParameters") or {}
-
-              if rota == "GET /fleet/devices":
-                  extra = {}
-                  if consulta.get("next"):
-                      extra["nextToken"] = consulta["next"]
-                  pagina = iot.list_things(maxResults=100, **extra)
-                  return resposta(200, {
-                      "devices": [t["thingName"] for t in pagina.get("things", [])],
-                      "next": pagina.get("nextToken"),
-                  })
-
-              if rota == "GET /fleet/devices/{device_id}":
-                  nome = caminho.get("device_id")
-                  try:
-                      iot.describe_thing(thingName=nome)
-                  except iot.exceptions.ResourceNotFoundException:
-                      return resposta(404, {"erro": f"device {nome} nao existe"})
-                  return resposta(200, {
-                      "device_id": nome,
-                      "endpoint": endpoint_mqtt(),
-                      "topics": {
-                          "telemetry": f"devices/{nome}/telemetry",
-                          "position": f"devices/{nome}/position",
-                      },
-                      "certificates": certificados_de(nome),
-                  })
-
-              return resposta(404, {"erro": "rota desconhecida"})
-
-  # Escrita: criar device + certificado, rotacionar, ativar/desativar, revogar.
-  FleetWriteFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub '${ProjectName}-fleet-write'
-      Runtime: python3.12
-      Handler: index.handler
-      Role: !GetAtt FleetWriteRole.Arn
-      Timeout: 30
-      MemorySize: 256
-      Environment:
-        Variables:
-          DEVICE_POLICY: !Ref DevicePolicy
-      Code:
-        ZipFile: |
-          import json
-          import os
-          import re
-
-          import boto3
-
-          iot = boto3.client("iot")
-          POLICY = os.environ["DEVICE_POLICY"]
-          NOME_OK = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
-          # Autenticacao no JWT authorizer nativo do gateway (Cognito User Pool):
-          # requisicao sem token valido nem chega a invocar esta funcao.
-
-
-          def resp(status, corpo):
-              return {"statusCode": status,
-                      "headers": {"content-type": "application/json",
-                                  "cache-control": "no-store"},
-                      "body": json.dumps(corpo)}
-
-
-          def emite(nome):
-              # Cria par de chaves ja ativo, anexa a policy da frota e o thing.
-              c = iot.create_keys_and_certificate(setAsActive=True)
-              iot.attach_policy(policyName=POLICY, target=c["certificateArn"])
-              iot.attach_thing_principal(thingName=nome, principal=c["certificateArn"])
-              ep = iot.describe_endpoint(endpointType="iot:Data-ATS")["endpointAddress"]
-              return {"device_id": nome,
-                      "certificate_id": c["certificateId"],
-                      # Chave privada devolvida SO aqui; nao e armazenada.
-                      "certificate_pem": c["certificatePem"],
-                      "private_key": c["keyPair"]["PrivateKey"],
-                      "endpoint": ep,
-                      "topics": {"telemetry": f"devices/{nome}/telemetry",
-                                 "position": f"devices/{nome}/position"}}
-
-
-          def cert_de(nome, cert_id):
-              for arn in iot.list_thing_principals(thingName=nome)["principals"]:
-                  if arn.split("/")[-1] == cert_id:
-                      return arn
-              return None
-
-
-          def revoga(nome, arn):
-              # Desativa antes de tudo: derruba a conexao mesmo se um passo falhar.
-              cid = arn.split("/")[-1]
-              iot.update_certificate(certificateId=cid, newStatus="INACTIVE")
-              iot.detach_policy(policyName=POLICY, target=arn)
-              iot.detach_thing_principal(thingName=nome, principal=arn)
-              iot.delete_certificate(certificateId=cid)
-
-
-          def handler(event, context):
-              rota = event.get("routeKey", "")
-              pp = event.get("pathParameters") or {}
-              nome = pp.get("device_id")
-              try:
-                  corpo = json.loads(event.get("body") or "{}")
-              except ValueError:
-                  return resp(400, {"erro": "body invalido"})
-
-              try:
-                  if rota == "POST /fleet/devices":
-                      nome = corpo.get("device_id") or ""
-                      if not NOME_OK.match(nome):
-                          return resp(400, {"erro": "device_id: [a-zA-Z0-9_-]{1,128}"})
-                      try:
-                          iot.create_thing(thingName=nome)
-                      except iot.exceptions.ResourceAlreadyExistsException:
-                          return resp(409, {"erro": f"device {nome} ja existe"})
-                      return resp(201, emite(nome))
-
-                  if rota == "POST /fleet/devices/{device_id}/certificates":
-                      iot.describe_thing(thingName=nome)   # 404 se nao existir
-                      return resp(201, emite(nome))
-
-                  if rota.startswith("PATCH "):
-                      estado = corpo.get("status")
-                      if estado not in ("ACTIVE", "INACTIVE"):
-                          return resp(400, {"erro": "status: ACTIVE ou INACTIVE"})
-                      cid = pp.get("certificate_id")
-                      if not cert_de(nome, cid):
-                          return resp(404, {"erro": "certificado nao e deste device"})
-                      iot.update_certificate(certificateId=cid, newStatus=estado)
-                      return resp(200, {"certificate_id": cid, "status": estado})
-
-                  if rota.startswith("DELETE ") and "{certificate_id}" in rota:
-                      arn = cert_de(nome, pp.get("certificate_id"))
-                      if not arn:
-                          return resp(404, {"erro": "certificado nao e deste device"})
-                      revoga(nome, arn)
-                      return resp(200, {"revoked": pp.get("certificate_id")})
-
-                  if rota == "DELETE /fleet/devices/{device_id}":
-                      arns = iot.list_thing_principals(thingName=nome)["principals"]
-                      for arn in arns:
-                          revoga(nome, arn)
-                      iot.delete_thing(thingName=nome)
-                      return resp(200, {"deleted": nome, "certificates": len(arns)})
-              except iot.exceptions.ResourceNotFoundException:
-                  return resp(404, {"erro": f"device {nome} nao existe"})
-
-              return resp(404, {"erro": "rota desconhecida"})
-
-  # Quem gere a frota e um usuario do Cognito, nao uma chave compartilhada.
-  # Sem autocadastro: usuario nasce por admin-create-user, nunca sozinho.
-  # SEM DeletionPolicy Retain de proposito: usuarios morrem com a pilha. Antes
-  # de valer em producao, adicione Retain -- e lembre da danca do
-  # ResourceExistenceCheck ao recriar (ver secao de recursos retidos).
+  # Sem autocadastro: usuario nasce por POST /api/users (ADMIN) ou pela CLI.
+  # SEM DeletionPolicy Retain enquanto o ambiente e de desenvolvimento;
+  # producao deve adicionar (usuarios sao estado).
   UserPool:
     Type: AWS::Cognito::UserPool
     Properties:
@@ -2200,13 +1657,32 @@ Resources:
       Policies:
         PasswordPolicy:
           MinimumLength: 12
+      LambdaConfig:
+        PreTokenGeneration: !GetAtt PreTokenFunction.Arn
+
+  # Papeis que o webapp entende. O pre-token-generation transforma o grupo no
+  # claim 'role' do ID token; o handler de usuarios impoe ADMIN na API.
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: ADMIN
+  OperatorGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: OPERATOR
+  ViewerGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: VIEWER
 
   UserPoolClient:
     Type: AWS::Cognito::UserPoolClient
     Properties:
       UserPoolId: !Ref UserPool
       ClientName: !Sub '${ProjectName}-api'
-      # Sem secret: o mesmo client serve CLI hoje e um frontend depois.
       GenerateSecret: false
       ExplicitAuthFlows:
         - ALLOW_USER_PASSWORD_AUTH
@@ -2214,7 +1690,255 @@ Resources:
         - ALLOW_REFRESH_TOKEN_AUTH
       PreventUserExistenceErrors: ENABLED
 
-  FleetReadRole:
+  PreTokenFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-pretoken'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt PreTokenRole.Arn
+      Timeout: 5
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          # Pre-token-generation do Cognito: injeta o claim 'role' no ID token a partir
+          # do grupo do usuario. O webapp argus decide o que mostrar por esse claim
+          # (decodeAccessClaims exige 'role' no payload).
+          ORDEM = ("ADMIN", "OPERATOR", "VIEWER")
+
+
+          def handler(event, context):
+              grupos = (
+                  event.get("request", {})
+                  .get("groupConfiguration", {})
+                  .get("groupsToOverride")
+                  or []
+              )
+              # Usuario em mais de um grupo fica com o mais forte.
+              papel = next((g for g in ORDEM if g in grupos), "VIEWER")
+              event["response"] = {
+                  "claimsOverrideDetails": {"claimsToAddOrOverride": {"role": papel}}
+              }
+              return event
+
+  PreTokenRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  PreTokenInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PreTokenFunction
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  # JWT authorizer nativo: o gateway valida o token do Cognito sem invocar
+  # Lambda. O accessToken devolvido pelo login e o ID TOKEN (aud = client id).
+  ArgusAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref RollupApi
+      Name: !Sub '${ProjectName}-cognito'
+      AuthorizerType: JWT
+      IdentitySource:
+        - '$request.header.Authorization'
+      JwtConfiguration:
+        Audience:
+          - !Ref UserPoolClient
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+
+  # ---- funcoes ---------------------------------------------------------------
+
+  AuthFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-argus-auth'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt AuthRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          CLIENT_ID: !Ref UserPoolClient
+      Code:
+        ZipFile: |
+          import json
+          import os
+
+          import boto3
+
+          idp = boto3.client("cognito-idp")
+          CLIENT_ID = os.environ["CLIENT_ID"]
+
+
+          def resp(status, corpo):
+              return {"statusCode": status,
+                      "headers": {"content-type": "application/json",
+                                  "cache-control": "no-store"},
+                      "body": json.dumps(corpo)}
+
+
+          def tokens(resultado, refresh_atual=None):
+              """Molda a resposta no TokenResponse do contrato argus.
+
+              O accessToken e o ID TOKEN do Cognito de proposito: e ele que carrega
+              email, aud e o claim 'role' que o pre-token-generation injeta -- e o que
+              o webapp decodifica. O access token do Cognito nao aceita claim custom
+              sem feature plan pago.
+              """
+              r = resultado["AuthenticationResult"]
+              return {
+                  "accessToken": r["IdToken"],
+                  # No refresh o Cognito nao devolve novo refresh token; o atual segue
+                  # valendo ate expirar.
+                  "refreshToken": r.get("RefreshToken") or refresh_atual,
+                  "expiresIn": r["ExpiresIn"],
+              }
+
+
+          def handler(event, context):
+              try:
+                  corpo = json.loads(event.get("body") or "{}")
+              except ValueError:
+                  return resp(400, {"message": "body invalido"})
+              rota = event.get("routeKey", "")
+
+              try:
+                  if rota == "POST /auth/login":
+                      email = corpo.get("email") or ""
+                      senha = corpo.get("password") or ""
+                      if not email or not senha:
+                          return resp(400, {"message": "email e password obrigatorios"})
+                      r = idp.initiate_auth(
+                          ClientId=CLIENT_ID,
+                          AuthFlow="USER_PASSWORD_AUTH",
+                          AuthParameters={"USERNAME": email, "PASSWORD": senha},
+                      )
+                      if "AuthenticationResult" not in r:
+                          # NEW_PASSWORD_REQUIRED etc.: fluxo de desafio nao suportado
+                          # pela API; o operador finaliza o cadastro pela CLI.
+                          return resp(409, {"message": f"desafio pendente: {r.get('ChallengeName')}"})
+                      return resp(200, tokens(r))
+
+                  if rota == "POST /auth/refresh":
+                      atual = corpo.get("refreshToken") or ""
+                      if not atual:
+                          return resp(400, {"message": "refreshToken obrigatorio"})
+                      r = idp.initiate_auth(
+                          ClientId=CLIENT_ID,
+                          AuthFlow="REFRESH_TOKEN_AUTH",
+                          AuthParameters={"REFRESH_TOKEN": atual},
+                      )
+                      return resp(200, tokens(r, refresh_atual=atual))
+              except (idp.exceptions.NotAuthorizedException,
+                      idp.exceptions.UserNotFoundException):
+                  return resp(401, {"message": "credenciais invalidas"})
+
+              return resp(404, {"message": "rota desconhecida"})
+
+  AuthRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: autentica
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: cognito-idp:InitiateAuth
+                Resource: !GetAtt UserPool.Arn
+
+  DevicesReadFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-argus-devices-read'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt DevicesReadRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE: !Ref RollupTable
+      Code:
+        ZipFile: |
+          import json
+          import os
+
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          TABELA = boto3.resource("dynamodb").Table(os.environ["TABLE"])
+
+
+          def resp(status, corpo):
+              return {"statusCode": status,
+                      "headers": {"content-type": "application/json",
+                                  "cache-control": "no-store"},
+                      "body": json.dumps(corpo)}
+
+
+          def molda(item):
+              """Item DEVICEMETA -> DeviceResponse do contrato argus."""
+              return {
+                  "id": item["sk"],
+                  "code": item["sk"],
+                  "label": item.get("label") or "",
+                  "createdAt": item.get("created_at"),
+                  "revokedAt": item.get("revoked_at"),
+                  "active": bool(item.get("active")),
+              }
+
+
+          def handler(event, context):
+              rota = event.get("routeKey", "")
+              caminho = event.get("pathParameters") or {}
+
+              if rota == "GET /api/devices":
+                  # Metadados numa particao unica: listar e uma Query, nao um Scan nem
+                  # N chamadas ao IoT. A particao cresce com a frota, nao com o dado.
+                  itens, proxima = [], None
+                  while True:
+                      extra = {"ExclusiveStartKey": proxima} if proxima else {}
+                      pagina = TABELA.query(
+                          KeyConditionExpression=Key("pk").eq("DEVICEMETA"), **extra
+                      )
+                      itens += pagina["Items"]
+                      proxima = pagina.get("LastEvaluatedKey")
+                      if not proxima:
+                          break
+                  return resp(200, [molda(i) for i in itens])
+
+              if rota == "GET /api/devices/{code}":
+                  codigo = caminho.get("code")
+                  r = TABELA.get_item(Key={"pk": "DEVICEMETA", "sk": codigo})
+                  if "Item" not in r:
+                      return resp(404, {"message": f"device {codigo} nao existe"})
+                  return resp(200, molda(r["Item"]))
+
+              return resp(404, {"message": "rota desconhecida"})
+
+  DevicesReadRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -2233,19 +1957,119 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
-                  - iot:ListThings
-                  - iot:DescribeEndpoint
-                Resource: '*'
-              - Effect: Allow
-                Action:
-                  - iot:DescribeThing
-                  - iot:ListThingPrincipals
-                Resource: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:thing/*'
-              - Effect: Allow
-                Action: iot:DescribeCertificate
-                Resource: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:cert/*'
+                  - dynamodb:Query
+                  - dynamodb:GetItem
+                Resource: !GetAtt RollupTable.Arn
 
-  FleetWriteRole:
+  DevicesWriteFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-argus-devices-write'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt DevicesWriteRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE: !Ref RollupTable
+          DEVICE_POLICY: !Ref DevicePolicy
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import re
+          from datetime import datetime, timezone
+
+          import boto3
+
+          iot = boto3.client("iot")
+          TABELA = boto3.resource("dynamodb").Table(os.environ["TABLE"])
+          POLICY = os.environ["DEVICE_POLICY"]
+          CODIGO_OK = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
+
+
+          def resp(status, corpo):
+              return {"statusCode": status,
+                      "headers": {"content-type": "application/json",
+                                  "cache-control": "no-store"},
+                      "body": json.dumps(corpo)}
+
+
+          def agora():
+              return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+          def molda(item):
+              return {"id": item["sk"], "code": item["sk"],
+                      "label": item.get("label") or "",
+                      "createdAt": item.get("created_at"),
+                      "revokedAt": item.get("revoked_at"),
+                      "active": bool(item.get("active"))}
+
+
+          def handler(event, context):
+              rota = event.get("routeKey", "")
+              caminho = event.get("pathParameters") or {}
+              codigo = caminho.get("code")
+              try:
+                  corpo = json.loads(event.get("body") or "{}")
+              except ValueError:
+                  return resp(400, {"message": "body invalido"})
+
+              if rota == "POST /api/devices":
+                  codigo = corpo.get("code") or ""
+                  rotulo = (corpo.get("label") or "").strip()
+                  if not CODIGO_OK.match(codigo):
+                      return resp(400, {"message": "code: [a-zA-Z0-9_-]{1,128}"})
+                  if not rotulo:
+                      return resp(400, {"message": "label obrigatorio"})
+                  try:
+                      iot.create_thing(thingName=codigo)
+                  except iot.exceptions.ResourceAlreadyExistsException:
+                      return resp(409, {"message": f"device {codigo} ja existe"})
+                  cert = iot.create_keys_and_certificate(setAsActive=True)
+                  iot.attach_policy(policyName=POLICY, target=cert["certificateArn"])
+                  iot.attach_thing_principal(
+                      thingName=codigo, principal=cert["certificateArn"]
+                  )
+                  # Label vive aqui, nao em atributo do thing: atributo de thing nao
+                  # aceita espaco, e rotulo humano tem espaco.
+                  item = {"pk": "DEVICEMETA", "sk": codigo, "label": rotulo,
+                          "created_at": agora(), "revoked_at": None, "active": True}
+                  TABELA.put_item(Item=item)
+                  ep = iot.describe_endpoint(
+                      endpointType="iot:Data-ATS"
+                  )["endpointAddress"]
+                  # O contrato tem UM campo de segredo. O bundle vai inteiro nele:
+                  # chave privada + certificado + endpoint, mostrado uma unica vez.
+                  chave = (f"# endpoint: {ep}\n# client id: {codigo}\n"
+                           f"{cert['keyPair']['PrivateKey']}\n{cert['certificatePem']}")
+                  return resp(201, {"device": molda(item), "key": chave})
+
+              if rota == "DELETE /api/devices/{code}/key":
+                  r = TABELA.get_item(Key={"pk": "DEVICEMETA", "sk": codigo})
+                  if "Item" not in r:
+                      return resp(404, {"message": f"device {codigo} nao existe"})
+                  try:
+                      arns = iot.list_thing_principals(thingName=codigo)["principals"]
+                  except iot.exceptions.ResourceNotFoundException:
+                      arns = []
+                  for arn in arns:
+                      cid = arn.split("/")[-1]
+                      # Desativa antes de tudo: derruba a conexao mesmo se um passo
+                      # seguinte falhar.
+                      iot.update_certificate(certificateId=cid, newStatus="INACTIVE")
+                      iot.detach_policy(policyName=POLICY, target=arn)
+                      iot.detach_thing_principal(thingName=codigo, principal=arn)
+                      iot.delete_certificate(certificateId=cid)
+                  item = dict(r["Item"], revoked_at=agora(), active=False)
+                  TABELA.put_item(Item=item)
+                  return resp(200, molda(item))
+
+              return resp(404, {"message": "rota desconhecida"})
+
+  DevicesWriteRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -2262,8 +2086,6 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              # CreateKeysAndCertificate e DescribeEndpoint nao aceitam
-              # escopo de recurso.
               - Effect: Allow
                 Action:
                   - iot:CreateKeysAndCertificate
@@ -2272,134 +2094,432 @@ Resources:
               - Effect: Allow
                 Action:
                   - iot:CreateThing
-                  - iot:DescribeThing
-                  - iot:DeleteThing
                   - iot:AttachThingPrincipal
                   - iot:DetachThingPrincipal
                   - iot:ListThingPrincipals
                 Resource: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:thing/*'
               - Effect: Allow
                 Action:
-                  - iot:DescribeCertificate
                   - iot:UpdateCertificate
                   - iot:DeleteCertificate
                   - iot:AttachPolicy
                   - iot:DetachPolicy
                 Resource: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:cert/*'
-              # AttachPolicy/DetachPolicy validam tambem a policy alvo.
               - Effect: Allow
                 Action:
                   - iot:AttachPolicy
                   - iot:DetachPolicy
                 Resource: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:policy/${DevicePolicy}'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt RollupTable.Arn
 
-  # JWT authorizer nativo do HTTP API: o gateway valida o token do Cognito
-  # (assinatura, expiracao, audience) sem invocar Lambda nenhuma. Requisicao
-  # sem token nem toca o codigo de negocio.
-  FleetAuthorizer:
-    Type: AWS::ApiGatewayV2::Authorizer
+  LocationsFunction:
+    Type: AWS::Lambda::Function
     Properties:
-      ApiId: !Ref RollupApi
-      Name: !Sub '${ProjectName}-cognito'
-      AuthorizerType: JWT
-      IdentitySource:
-        - '$request.header.Authorization'
-      JwtConfiguration:
-        Audience:
-          - !Ref UserPoolClient
-        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+      FunctionName: !Sub '${ProjectName}-argus-locations'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt DevicesReadRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE: !Ref RollupTable
+      Code:
+        ZipFile: |
+          import json
+          import os
+          from datetime import datetime, timezone
 
-  FleetReadIntegration:
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          TABELA = boto3.resource("dynamodb").Table(os.environ["TABLE"])
+          LIMITE_MAX = 500
+
+
+          def resp(status, corpo):
+              return {"statusCode": status,
+                      "headers": {"content-type": "application/json",
+                                  "cache-control": "no-store"},
+                      "body": json.dumps(corpo)}
+
+
+          def molda(codigo, item):
+              """Item TRACK/LATEST -> LocationResponse do contrato argus."""
+              ts = item.get("ts") or item.get("at")
+              return {
+                  # id numerico que o contrato pede; epoch ms do fix e unico o
+                  # bastante por device e estavel entre paginas.
+                  "id": int(datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+                            .replace(tzinfo=timezone.utc).timestamp() * 1000),
+                  "deviceCode": codigo,
+                  "ts": ts,
+                  "lat": float(item["lat"]),
+                  "lon": float(item["lon"]),
+                  # Ingestao registra km/h (contrato MQTT); o argus espera m/s.
+                  "speedMps": (round(float(item["speed"]) / 3.6, 3)
+                               if item.get("speed") is not None else None),
+                  "courseDeg": (float(item["heading"])
+                                if item.get("heading") is not None else None),
+                  "sats": None,
+                  "hdop": None,
+                  "receivedAt": item.get("received_at") or ts,
+              }
+
+
+          def handler(event, context):
+              rota = event.get("routeKey", "")
+              q = event.get("queryStringParameters") or {}
+
+              if rota == "GET /api/locations/latest":
+                  # DEVICEMETA lista a frota; um GetItem por device pega o LATEST que a
+                  # ingestao mantem. Custo acompanha o tamanho da frota.
+                  frota = TABELA.query(
+                      KeyConditionExpression=Key("pk").eq("DEVICEMETA")
+                  )["Items"]
+                  saida = []
+                  for meta in frota:
+                      r = TABELA.get_item(
+                          Key={"pk": f"DEV#{meta['sk']}#position", "sk": "LATEST"}
+                      )
+                      if "Item" in r:
+                          saida.append(molda(meta["sk"], r["Item"]))
+                  return resp(200, saida)
+
+              if rota == "GET /api/locations":
+                  codigo = q.get("device")
+                  if not codigo:
+                      return resp(400, {"message": "device obrigatorio"})
+                  limite = min(int(q.get("limit") or 100), LIMITE_MAX)
+                  cond = Key("pk").eq(f"TRACK#{codigo}")
+                  de, ate = q.get("from"), q.get("to")
+                  # `to` e EXCLUSIVO: e o cursor da paginacao keyset, entao a linha do
+                  # cursor nao pode reaparecer na pagina seguinte. between e inclusivo,
+                  # dai o filtro apos a Query quando from e to vem juntos.
+                  if de and ate:
+                      cond &= Key("sk").between(de, ate)
+                  elif ate:
+                      cond &= Key("sk").lt(ate)
+                  elif de:
+                      cond &= Key("sk").gte(de)
+                  pagina = TABELA.query(
+                      KeyConditionExpression=cond,
+                      ScanIndexForward=False,       # mais recente primeiro
+                      Limit=limite,
+                  )
+                  linhas = [i for i in pagina["Items"] if not ate or i["sk"] < ate]
+                  itens = [molda(codigo, i) for i in linhas]
+                  # Keyset: o proximo pedido repassa o cursor no parametro `to`.
+                  cursor = (linhas[-1]["sk"]
+                            if linhas and pagina.get("LastEvaluatedKey") else None)
+                  return resp(200, {"items": itens, "nextCursor": cursor})
+
+              return resp(404, {"message": "rota desconhecida"})
+
+  UsersFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-argus-users'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt UsersRole.Arn
+      Timeout: 20
+      MemorySize: 256
+      Environment:
+        Variables:
+          USER_POOL: !Ref UserPool
+      Code:
+        ZipFile: |
+          import json
+          import os
+
+          import boto3
+
+          idp = boto3.client("cognito-idp")
+          POOL = os.environ["USER_POOL"]
+          PAPEIS = ("ADMIN", "OPERATOR", "VIEWER")
+
+
+          def resp(status, corpo):
+              return {"statusCode": status,
+                      "headers": {"content-type": "application/json",
+                                  "cache-control": "no-store"},
+                      "body": json.dumps(corpo)}
+
+
+          def papel_de(claims):
+              return (claims or {}).get("role") or "VIEWER"
+
+
+          def atributos(usuario):
+              return {a["Name"]: a["Value"] for a in usuario.get("Attributes")
+                      or usuario.get("UserAttributes") or []}
+
+
+          def molda(usuario, papel):
+              at = atributos(usuario)
+              return {
+                  "id": at.get("sub") or usuario["Username"],
+                  "email": at.get("email") or usuario["Username"],
+                  "name": at.get("name") or "",
+                  "role": papel,
+                  "createdAt": usuario["UserCreateDate"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  "disabledAt": None if usuario.get("Enabled", True) else "",
+              }
+
+
+          def handler(event, context):
+              claims = (event.get("requestContext", {}).get("authorizer", {})
+                        .get("jwt", {}).get("claims", {}))
+              # So ADMIN gere usuarios -- mesmo criterio que o webapp usa para exibir a
+              # tela, mas imposto aqui, onde vale.
+              if papel_de(claims) != "ADMIN":
+                  return resp(403, {"message": "apenas ADMIN gere usuarios"})
+
+              rota = event.get("routeKey", "")
+              try:
+                  corpo = json.loads(event.get("body") or "{}")
+              except ValueError:
+                  return resp(400, {"message": "body invalido"})
+
+              if rota == "GET /api/users":
+                  saida = []
+                  for u in idp.list_users(UserPoolId=POOL, Limit=60)["Users"]:
+                      grupos = idp.admin_list_groups_for_user(
+                          UserPoolId=POOL, Username=u["Username"]
+                      )["Groups"]
+                      nomes = [g["GroupName"] for g in grupos]
+                      papel = next((p for p in PAPEIS if p in nomes), "VIEWER")
+                      saida.append(molda(u, papel))
+                  return resp(200, saida)
+
+              if rota == "POST /api/users":
+                  email = corpo.get("email") or ""
+                  senha = corpo.get("password") or ""
+                  nome = (corpo.get("name") or "").strip()
+                  papel = corpo.get("role") or "VIEWER"
+                  if not email or not senha or not nome:
+                      return resp(400, {"message": "email, password e name obrigatorios"})
+                  if papel not in PAPEIS:
+                      return resp(400, {"message": f"role: {'|'.join(PAPEIS)}"})
+                  try:
+                      idp.admin_create_user(
+                          UserPoolId=POOL, Username=email, MessageAction="SUPPRESS",
+                          UserAttributes=[
+                              {"Name": "email", "Value": email},
+                              {"Name": "email_verified", "Value": "true"},
+                              {"Name": "name", "Value": nome},
+                          ],
+                      )
+                  except idp.exceptions.UsernameExistsException:
+                      return resp(409, {"message": f"{email} ja existe"})
+                  idp.admin_set_user_password(
+                      UserPoolId=POOL, Username=email, Password=senha, Permanent=True
+                  )
+                  idp.admin_add_user_to_group(
+                      UserPoolId=POOL, Username=email, GroupName=papel
+                  )
+                  u = idp.admin_get_user(UserPoolId=POOL, Username=email)
+                  return resp(201, molda(u, papel))
+
+              return resp(404, {"message": "rota desconhecida"})
+
+  UsersRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: gere-usuarios
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:ListUsers
+                  - cognito-idp:AdminListGroupsForUser
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminSetUserPassword
+                  - cognito-idp:AdminAddUserToGroup
+                  - cognito-idp:AdminGetUser
+                Resource: !GetAtt UserPool.Arn
+
+  # ---- integracoes, rotas e permissoes --------------------------------------
+
+  AuthIntegration:
     Type: AWS::ApiGatewayV2::Integration
     Properties:
       ApiId: !Ref RollupApi
       IntegrationType: AWS_PROXY
-      IntegrationUri: !GetAtt FleetReadFunction.Arn
+      IntegrationUri: !GetAtt AuthFunction.Arn
       PayloadFormatVersion: '2.0'
 
-  FleetWriteIntegration:
+  DevicesReadIntegration:
     Type: AWS::ApiGatewayV2::Integration
     Properties:
       ApiId: !Ref RollupApi
       IntegrationType: AWS_PROXY
-      IntegrationUri: !GetAtt FleetWriteFunction.Arn
+      IntegrationUri: !GetAtt DevicesReadFunction.Arn
       PayloadFormatVersion: '2.0'
 
-  FleetListRoute:
+  DevicesWriteIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RollupApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt DevicesWriteFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  LocationsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RollupApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt LocationsFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  UsersIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RollupApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt UsersFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  # Login e refresh sao as unicas rotas sem authorizer: e onde o token nasce.
+  LoginRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'GET /fleet/devices'
-      AuthorizationType: JWT
-      AuthorizerId: !Ref FleetAuthorizer
-      Target: !Sub 'integrations/${FleetReadIntegration}'
+      RouteKey: 'POST /auth/login'
+      Target: !Sub 'integrations/${AuthIntegration}'
 
-  FleetDetailRoute:
+  RefreshRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'GET /fleet/devices/{device_id}'
-      AuthorizationType: JWT
-      AuthorizerId: !Ref FleetAuthorizer
-      Target: !Sub 'integrations/${FleetReadIntegration}'
+      RouteKey: 'POST /auth/refresh'
+      Target: !Sub 'integrations/${AuthIntegration}'
 
-  FleetCreateRoute:
+  DevicesListRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'POST /fleet/devices'
+      RouteKey: 'GET /api/devices'
       AuthorizationType: JWT
-      AuthorizerId: !Ref FleetAuthorizer
-      Target: !Sub 'integrations/${FleetWriteIntegration}'
+      AuthorizerId: !Ref ArgusAuthorizer
+      Target: !Sub 'integrations/${DevicesReadIntegration}'
 
-  FleetRotateRoute:
+  DevicesDetailRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'POST /fleet/devices/{device_id}/certificates'
+      RouteKey: 'GET /api/devices/{code}'
       AuthorizationType: JWT
-      AuthorizerId: !Ref FleetAuthorizer
-      Target: !Sub 'integrations/${FleetWriteIntegration}'
+      AuthorizerId: !Ref ArgusAuthorizer
+      Target: !Sub 'integrations/${DevicesReadIntegration}'
 
-  FleetCertStatusRoute:
+  DevicesCreateRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'PATCH /fleet/devices/{device_id}/certificates/{certificate_id}'
+      RouteKey: 'POST /api/devices'
       AuthorizationType: JWT
-      AuthorizerId: !Ref FleetAuthorizer
-      Target: !Sub 'integrations/${FleetWriteIntegration}'
+      AuthorizerId: !Ref ArgusAuthorizer
+      Target: !Sub 'integrations/${DevicesWriteIntegration}'
 
-  FleetRevokeCertRoute:
+  DevicesRevokeRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'DELETE /fleet/devices/{device_id}/certificates/{certificate_id}'
+      RouteKey: 'DELETE /api/devices/{code}/key'
       AuthorizationType: JWT
-      AuthorizerId: !Ref FleetAuthorizer
-      Target: !Sub 'integrations/${FleetWriteIntegration}'
+      AuthorizerId: !Ref ArgusAuthorizer
+      Target: !Sub 'integrations/${DevicesWriteIntegration}'
 
-  FleetDeleteDeviceRoute:
+  LocationsHistoryRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'DELETE /fleet/devices/{device_id}'
+      RouteKey: 'GET /api/locations'
       AuthorizationType: JWT
-      AuthorizerId: !Ref FleetAuthorizer
-      Target: !Sub 'integrations/${FleetWriteIntegration}'
+      AuthorizerId: !Ref ArgusAuthorizer
+      Target: !Sub 'integrations/${LocationsIntegration}'
 
-  FleetReadInvokePermission:
+  LocationsLatestRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'GET /api/locations/latest'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ArgusAuthorizer
+      Target: !Sub 'integrations/${LocationsIntegration}'
+
+  UsersListRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'GET /api/users'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ArgusAuthorizer
+      Target: !Sub 'integrations/${UsersIntegration}'
+
+  UsersCreateRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'POST /api/users'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ArgusAuthorizer
+      Target: !Sub 'integrations/${UsersIntegration}'
+
+  AuthInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
-      FunctionName: !Ref FleetReadFunction
+      FunctionName: !Ref AuthFunction
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
 
-  FleetWriteInvokePermission:
+  DevicesReadInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
-      FunctionName: !Ref FleetWriteFunction
+      FunctionName: !Ref DevicesReadFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
+
+  DevicesWriteInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DevicesWriteFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
+
+  LocationsInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LocationsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
+
+  UsersInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UsersFunction
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
