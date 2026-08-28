@@ -1748,7 +1748,10 @@ Resources:
     Type: AWS::ApiGatewayV2::Authorizer
     Properties:
       ApiId: !Ref RollupApi
-      Name: !Sub '${ProjectName}-cognito'
+      # Nao pode chamar '${ProjectName}-cognito': o update cria o recurso novo
+      # ANTES de deletar o FleetAuthorizer antigo, e nome de authorizer e
+      # unico por API -- renomear o id logico exige nome fisico novo.
+      Name: !Sub '${ProjectName}-argus-cognito'
       AuthorizerType: JWT
       IdentitySource:
         - '$request.header.Authorization'
