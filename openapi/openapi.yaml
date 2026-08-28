@@ -237,7 +237,7 @@ components:
         credentials: {$ref: '#/components/schemas/DeviceCredentials'}
     LocationResponse:
       type: object
-      required: [id, deviceCode, ts, lat, lon, receivedAt]
+      required: [id, deviceCode, ts, lat, lon, speedMps, courseDeg, sats, hdop, receivedAt]
       properties:
         id: {type: integer, format: int64, description: Epoch ms do fix.}
         deviceCode: {type: string}
