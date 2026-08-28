@@ -408,6 +408,13 @@ de séries distintas e não o tamanho do histórico. O TTL desses itens é
 renovado a cada execução do job: um device que parar de reportar sai da
 listagem sozinho depois de `HotStoreTtlDays`, sem rotina de limpeza.
 
+Cada etapa do job cadastra as suas séries: a de telemetria grava uma entrada
+por `(device, métrica)`, e a de posições grava `metric = "position"` por
+trator. São blocos independentes de propósito — um trator que só reporta GPS
+aparece em `/devices` mesmo num dia sem nenhuma telemetria escalar. O
+`"position"` também é o marcador que o dashboard usa para separar as abas: a
+série lista devices com métrica escalar, o mapa lista devices com posição.
+
 ```bash
 API=$(aws cloudformation describe-stacks --stack-name <sua-pilha> \
   --query "Stacks[0].Outputs[?OutputKey=='ApiEndpoint'].OutputValue" --output text)

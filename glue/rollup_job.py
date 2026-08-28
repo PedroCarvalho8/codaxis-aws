@@ -490,13 +490,30 @@ if posicoes.head(1):
     table = boto3.resource("dynamodb").Table(DYNAMO_TABLE)
     with table.batch_writer(overwrite_by_pkeys=["pk", "sk"]) as batch:
         for linha in recentes:
+            visto = linha["event_time"].strftime("%Y-%m-%dT%H:%M:%SZ")
             batch.put_item(
                 Item={
                     "pk": f"DEV#{linha['device_id']}#position",
                     "sk": "LATEST",
                     "lat": Decimal(str(round(float(linha["lat"]), 7))),
                     "lon": Decimal(str(round(float(linha["lon"]), 7))),
-                    "at": linha["event_time"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "at": visto,
+                    "expires_at": expira_heat,
+                }
+            )
+            # Entrada de catalogo do device de posicao. O write_catalog da
+            # telemetria le so telemetry_raw, entao um trator que apenas
+            # reporta posicao nunca apareceria em /devices -- e o seletor do
+            # mapa ficaria vazio. "position" como metric tambem e o marcador
+            # que o frontend usa para separar serie de mapa.
+            batch.put_item(
+                Item={
+                    "pk": "CATALOG",
+                    "sk": f"DEV#{linha['device_id']}#position",
+                    "device_id": linha["device_id"],
+                    "metric": "position",
+                    "unit": "",
+                    "last_seen": visto,
                     "expires_at": expira_heat,
                 }
             )

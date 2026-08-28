@@ -57,6 +57,10 @@ CATALOGO = [
      "last_seen": "2026-08-27T02:00:00Z"},
     {"device_id": "sensor-01", "metric": "humidity", "unit": "%",
      "last_seen": "2026-08-27T02:00:00Z"},
+    # Device de GPS: o bloco de posicoes do job cadastra com metric
+    # "position", que e o marcador que o frontend usa para separar as abas.
+    {"device_id": "trator-01", "metric": "position", "unit": "",
+     "last_seen": "2026-08-27T03:00:00Z"},
 ]
 
 
@@ -190,9 +194,13 @@ checa("cors", aberta["headers"]["access-control-allow-origin"], "*")
 # ---------------------------------------------------------------- catalogo
 catalogo = json.loads(handler_catalogo({}, None)["body"])
 checa("catalogo: Query em CATALOG", "CATALOG" in capturado["chaves"], True)
-checa("catalogo: contagem de devices", catalogo["count"], 2)
+checa("catalogo: contagem de devices", catalogo["count"], 3)
 checa("catalogo: ordem dos devices",
-      [d["device_id"] for d in catalogo["devices"]], ["sensor-01", "sensor-02"])
+      [d["device_id"] for d in catalogo["devices"]],
+      ["sensor-01", "sensor-02", "trator-01"])
+checa("catalogo: device de posicao presente com o marcador",
+      catalogo["devices"][2]["metrics"], [
+          {"metric": "position", "unit": None, "last_seen": "2026-08-27T03:00:00Z"}])
 checa("catalogo: metricas agrupadas e ordenadas",
       [m["metric"] for m in catalogo["devices"][0]["metrics"]],
       ["humidity", "temperature"])

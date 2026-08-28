@@ -327,17 +327,32 @@
   }
 
   // -------------------------------------------------------------- catálogo
+  function temEscalar(d) {
+    return d.metrics.some(function (m) { return m.metric !== "position"; });
+  }
+
+  function temPosicao(d) {
+    return d.metrics.some(function (m) { return m.metric === "position"; });
+  }
+
+  function preencheSeletor(seletor, dispositivos) {
+    seletor.innerHTML = "";
+    dispositivos.forEach(function (d) {
+      var o = document.createElement("option");
+      o.value = d.device_id;
+      o.textContent = d.device_id;
+      seletor.appendChild(o);
+    });
+  }
+
   function carregaCatalogo() {
     return pegar("/devices").then(function (dados) {
       catalogo = dados.devices || [];
-      var sel = el("device");
-      sel.innerHTML = "";
-      catalogo.forEach(function (d) {
-        var o = document.createElement("option");
-        o.value = d.device_id;
-        o.textContent = d.device_id;
-        sel.appendChild(o);
-      });
+      // "position" e o marcador que o Glue Job grava para device de GPS.
+      // Cada aba lista so o que sabe mostrar: um trator sem sensor escalar
+      // nao aparece na serie, um sensor fixo nao aparece no mapa.
+      preencheSeletor(el("device"), catalogo.filter(temEscalar));
+      preencheSeletor(el("mapa-device"), catalogo.filter(temPosicao));
       el("resumo-fonte").textContent =
         catalogo.length + (catalogo.length === 1 ? " dispositivo" : " dispositivos");
       if (!catalogo.length) {
@@ -345,14 +360,15 @@
                     + "essa lista na primeira execução após a chegada de dados.");
         return false;
       }
-      var mapaSel = el("mapa-device");
-      mapaSel.innerHTML = sel.innerHTML;
+      if (!el("device").options.length) {
+        mostraAviso("Nenhum dispositivo com métrica escalar; veja a aba Mapa.");
+      }
       var hoje = new Date();
       var semana = new Date(hoje.getTime() - 6 * 86400000);
       el("mapa-ate").value = hoje.toISOString().slice(0, 10);
       el("mapa-de").value = semana.toISOString().slice(0, 10);
       preencheMetricas();
-      return true;
+      return el("device").options.length > 0;
     });
   }
 
@@ -366,6 +382,7 @@
     var sel = el("metric");
     sel.innerHTML = "";
     (d ? d.metrics : []).forEach(function (m) {
+      if (m.metric === "position") return;   // posicao mora na aba Mapa
       var o = document.createElement("option");
       o.value = m.metric;
       o.textContent = m.metric + (m.unit ? " (" + m.unit + ")" : "");
@@ -708,7 +725,11 @@
 
   function carregaMapa() {
     var device = el("mapa-device").value;
-    if (!device) return;
+    if (!device) {
+      avisoMapa("Nenhum dispositivo com posição no catálogo ainda. O Glue "
+                + "Job cadastra na primeira execução após chegarem fixes.");
+      return;
+    }
     var de = el("mapa-de").value, ate = el("mapa-ate").value;
     if (!de || !ate) return;
 
