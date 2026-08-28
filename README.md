@@ -2,9 +2,13 @@
 
 Backend de telemetria de campo: recepção (MQTT com certificado X.509 por
 device), armazenamento (Iceberg bruto + DynamoDB quente), tratamento (Glue
-Job de rollups e heatmap) e a API que o webapp
-[argus](https://github.com/PedroDaniluz/argus-webapp) consome — mesmo
-contrato OpenAPI: `/auth/*`, `/api/devices`, `/api/locations`, `/api/users`.
+Job de rollups e heatmap) e a API `/v1`.
+
+**O contrato nasce aqui**: `openapi/openapi.yaml` é a fonte da verdade. Os
+handlers implementam a spec (o CI falha se rota e spec divergirem), e clients
+— o [argus-webapp](https://github.com/PedroDaniluz/argus-webapp) — são
+gerados dela via orval, apontando `ARGUS_OPENAPI` para o arquivo publicado
+neste repositório.
 
 Pilha CloudFormation vinculada a este repositório via **Git sync**: a cada
 push nesta branch o serviço reaplica a pilha a partir de `template.yaml`,
@@ -390,23 +394,27 @@ olhando os mesmos devices.
 
 HTTP API (API Gateway v2), duas rotas, cada uma com sua Lambda:
 
-As rotas espelham o contrato que o argus gera via orval:
+O contrato completo está em `openapi/openapi.yaml`; resumo:
 
 ```
-POST   /auth/login      {email, password}   ->  {accessToken, refreshToken, expiresIn}
-POST   /auth/refresh    {refreshToken}
+POST   /v1/auth/login    {email, password}  ->  {accessToken, refreshToken, expiresIn}
+POST   /v1/auth/refresh  {refreshToken}
 
-GET    /api/devices                             DeviceResponse[]
-GET    /api/devices/{code}
-POST   /api/devices     {code, label}       ->  {device, key}   (key: uma vez)
-DELETE /api/devices/{code}/key                  revoga os certificados
+GET    /v1/devices                              DeviceResponse[]
+GET    /v1/devices/{code}
+POST   /v1/devices       {code, label}      ->  {device, credentials}
+DELETE /v1/devices/{code}/credentials           revoga os certificados
 
-GET    /api/locations/latest                    LocationResponse[]
-GET    /api/locations?device&from&to&limit      LocationPage (keyset por `to`)
+GET    /v1/devices/{code}/locations?from&to&limit   LocationPage (keyset por `to`)
+GET    /v1/locations/latest                     LocationResponse[]
 
-GET    /api/users                               (apenas ADMIN)
-POST   /api/users       {email, password, name, role}
+GET    /v1/users                                (apenas ADMIN)
+POST   /v1/users         {email, password, name, role}
 ```
+
+`credentials` é estruturado — `{privateKeyPem, certificatePem, mqttEndpoint,
+clientId, topics}` — e aparece **uma única vez**, na criação. Erros saem no
+formato `ApiError` da spec (`timestamp/status/error/message/path/fields`).
 
 Tudo menos `/auth/*` exige `Authorization: Bearer <accessToken>`. O
 `accessToken` é o **ID token** do Cognito — é ele que carrega `email` e o
@@ -520,9 +528,9 @@ ambiente é de desenvolvimento; produção deve adicionar.
 
 ## Devices e certificados
 
-`POST /api/devices {code, label}` cria o thing, emite o certificado X.509 e
-devolve `key` **uma única vez** — um bundle com a chave privada, o certificado
-e o endpoint MQTT, pronto para gravar no firmware. Metadados (label,
+`POST /v1/devices {code, label}` cria o thing, emite o certificado X.509 e
+devolve as credenciais **uma única vez** — chave privada, certificado,
+endpoint MQTT, client id e tópicos, prontos para o firmware. Metadados (label,
 created_at, active) vivem no DynamoDB, não em atributo de thing — atributo de
 thing não aceita espaço, e rótulo humano tem espaço.
 
@@ -531,7 +539,7 @@ do IoT: o certificado só conecta com o client id do próprio thing e só public
 nos tópicos dele (`devices/<code>/telemetry|position` e basic ingest). Sem
 `Subscribe`, sem `Receive`.
 
-`DELETE /api/devices/{code}/key` desativa o certificado **antes** de desanexar
+`DELETE /v1/devices/{code}/credentials` desativa o certificado **antes** de desanexar
 e apagar — a conexão cai mesmo se um passo seguinte falhar — e marca o device
 como revogado. Antes de deletar a **pilha**, revogue os devices: a política da
 frota não pode ser removida com certificado anexado.
@@ -540,16 +548,16 @@ frota não pode ser removida com certificado anexado.
 
 A transform de posição do Firehose, além de repassar ao Iceberg, grava no
 DynamoDB o rastro (`TRACK#<code>`, TTL de `HotStoreTtlDays`) e a última
-posição (`LATEST`) — é o que `/api/locations` serve com latência de ~1 min
+posição (`LATEST`) — é o que `/v1/devices/{code}/locations` serve com latência de ~1 min
 (buffer da Lambda no Firehose), sem esperar o job horário. O Iceberg continua
 sendo a fonte histórica completa.
 
-`GET /api/locations` pagina por keyset: `to` é **exclusivo** e cada página
+`GET /v1/devices/{code}/locations` pagina por keyset: `to` é **exclusivo** e cada página
 devolve `nextCursor` para ser repassado como `to` — o formato que o
 `useInfiniteQuery` gerado no argus espera. `speedMps` sai convertido do `speed`
 em km/h do contrato MQTT.
 
-O que a pilha **não** serve ao argus: `GET /api/locations/stream` (SSE). O
+O que a pilha **não** serve ao argus: o stream SSE de posições. O
 HTTP API não sustenta resposta em streaming de Lambda; o PR de integração no
 argus adiciona fallback de polling sobre `/api/locations/latest`.
 

@@ -1,0 +1,294 @@
+openapi: 3.0.3
+info:
+  title: CodAxis Telemetry API
+  version: '1.0'
+  description: >
+    API do backend codaxis-aws: autenticacao, gestao da frota (things e
+    certificados X.509 no IoT Core), localizacoes em tempo quase real e
+    usuarios. Este arquivo e a FONTE DO CONTRATO: os handlers implementam o
+    que esta aqui, e clients (como o argus-webapp) sao gerados daqui.
+paths:
+  /v1/auth/login:
+    post:
+      operationId: login
+      tags: [auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/LoginRequest'}
+      responses:
+        '200':
+          description: Tokens emitidos.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TokenResponse'}
+        '401': {$ref: '#/components/responses/Erro'}
+  /v1/auth/refresh:
+    post:
+      operationId: refreshToken
+      tags: [auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RefreshRequest'}
+      responses:
+        '200':
+          description: Access token renovado; o refresh token segue o mesmo.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TokenResponse'}
+        '401': {$ref: '#/components/responses/Erro'}
+  /v1/devices:
+    get:
+      operationId: listDevices
+      tags: [devices]
+      responses:
+        '200':
+          description: Frota completa.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/DeviceResponse'}
+    post:
+      operationId: createDevice
+      tags: [devices]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateDeviceRequest'}
+      responses:
+        '201':
+          description: >
+            Device criado. As credenciais aparecem SOMENTE nesta resposta;
+            a chave privada nao fica armazenada.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DeviceCreated'}
+        '409': {$ref: '#/components/responses/Erro'}
+  /v1/devices/{code}:
+    get:
+      operationId: getDevice
+      tags: [devices]
+      parameters: [{$ref: '#/components/parameters/Code'}]
+      responses:
+        '200':
+          description: Um device.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DeviceResponse'}
+        '404': {$ref: '#/components/responses/Erro'}
+  /v1/devices/{code}/credentials:
+    delete:
+      operationId: revokeDeviceCredentials
+      tags: [devices]
+      description: >
+        Revoga todos os certificados do device: desativa (a conexao cai),
+        desanexa e apaga. O device permanece cadastrado, inativo.
+      parameters: [{$ref: '#/components/parameters/Code'}]
+      responses:
+        '200':
+          description: Device apos a revogacao.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DeviceResponse'}
+        '404': {$ref: '#/components/responses/Erro'}
+  /v1/devices/{code}/locations:
+    get:
+      operationId: getLocationHistory
+      tags: [locations]
+      description: >
+        Rastro do device, mais recente primeiro. Paginacao keyset: `to` e
+        EXCLUSIVO e cada pagina devolve `nextCursor` para ser repassado como
+        `to` da seguinte.
+      parameters:
+        - {$ref: '#/components/parameters/Code'}
+        - {name: from, in: query, schema: {type: string, format: date-time}}
+        - {name: to, in: query, schema: {type: string, format: date-time}}
+        - {name: limit, in: query, schema: {type: integer, maximum: 500, default: 100}}
+      responses:
+        '200':
+          description: Uma pagina do rastro.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LocationPage'}
+        '404': {$ref: '#/components/responses/Erro'}
+  /v1/locations/latest:
+    get:
+      operationId: getLatestLocations
+      tags: [locations]
+      description: Ultima posicao conhecida de cada device da frota.
+      responses:
+        '200':
+          description: Uma posicao por device com posicao registrada.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/LocationResponse'}
+  /v1/users:
+    get:
+      operationId: listUsers
+      tags: [users]
+      description: Apenas ADMIN.
+      responses:
+        '200':
+          description: Usuarios do pool.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/UserResponse'}
+        '403': {$ref: '#/components/responses/Erro'}
+    post:
+      operationId: createUser
+      tags: [users]
+      description: Apenas ADMIN.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateUserRequest'}
+      responses:
+        '201':
+          description: Usuario criado com senha definitiva.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UserResponse'}
+        '403': {$ref: '#/components/responses/Erro'}
+        '409': {$ref: '#/components/responses/Erro'}
+components:
+  securitySchemes:
+    bearer: {type: http, scheme: bearer, bearerFormat: JWT}
+  parameters:
+    Code:
+      name: code
+      in: path
+      required: true
+      schema: {type: string, pattern: '^[a-zA-Z0-9_-]{1,128}$'}
+  responses:
+    Erro:
+      description: Erro no formato ApiError.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ApiError'}
+  schemas:
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: {type: string, format: email}
+        password: {type: string}
+    RefreshRequest:
+      type: object
+      required: [refreshToken]
+      properties:
+        refreshToken: {type: string}
+    TokenResponse:
+      type: object
+      required: [accessToken, refreshToken, expiresIn]
+      description: >
+        accessToken e o ID token do Cognito; carrega os claims email e role
+        (ADMIN | OPERATOR | VIEWER).
+      properties:
+        accessToken: {type: string}
+        refreshToken: {type: string}
+        expiresIn: {type: integer, description: Segundos de validade do accessToken.}
+    CreateDeviceRequest:
+      type: object
+      required: [code, label]
+      properties:
+        code: {type: string, pattern: '^[a-zA-Z0-9_-]{1,128}$'}
+        label: {type: string, minLength: 1}
+    DeviceResponse:
+      type: object
+      required: [id, code, label, createdAt, revokedAt, active]
+      properties:
+        id: {type: string}
+        code: {type: string}
+        label: {type: string}
+        createdAt: {type: string, format: date-time}
+        revokedAt: {type: string, format: date-time, nullable: true}
+        active: {type: boolean}
+    DeviceCredentials:
+      type: object
+      required: [privateKeyPem, certificatePem, mqttEndpoint, clientId, topics]
+      properties:
+        privateKeyPem: {type: string}
+        certificatePem: {type: string}
+        mqttEndpoint: {type: string}
+        clientId: {type: string}
+        topics:
+          type: object
+          required: [telemetry, position]
+          properties:
+            telemetry: {type: string}
+            position: {type: string}
+    DeviceCreated:
+      type: object
+      required: [device, credentials]
+      properties:
+        device: {$ref: '#/components/schemas/DeviceResponse'}
+        credentials: {$ref: '#/components/schemas/DeviceCredentials'}
+    LocationResponse:
+      type: object
+      required: [id, deviceCode, ts, lat, lon, receivedAt]
+      properties:
+        id: {type: integer, format: int64, description: Epoch ms do fix.}
+        deviceCode: {type: string}
+        ts: {type: string, format: date-time}
+        lat: {type: number}
+        lon: {type: number}
+        speedMps: {type: number, nullable: true}
+        courseDeg: {type: number, nullable: true}
+        sats: {type: integer, nullable: true}
+        hdop: {type: number, nullable: true}
+        receivedAt: {type: string, format: date-time}
+    LocationPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/LocationResponse'}
+        nextCursor: {type: string, nullable: true}
+    Role:
+      type: string
+      enum: [ADMIN, OPERATOR, VIEWER]
+    CreateUserRequest:
+      type: object
+      required: [email, password, name, role]
+      properties:
+        email: {type: string, format: email}
+        password: {type: string, minLength: 12}
+        name: {type: string, minLength: 1}
+        role: {$ref: '#/components/schemas/Role'}
+    UserResponse:
+      type: object
+      required: [id, email, name, role, createdAt, disabledAt]
+      properties:
+        id: {type: string}
+        email: {type: string}
+        name: {type: string}
+        role: {$ref: '#/components/schemas/Role'}
+        createdAt: {type: string, format: date-time}
+        disabledAt: {type: string, format: date-time, nullable: true}
+    ApiError:
+      type: object
+      required: [timestamp, status, error, message, path, fields]
+      properties:
+        timestamp: {type: string, format: date-time}
+        status: {type: integer}
+        error: {type: string}
+        message: {type: string}
+        path: {type: string}
+        fields:
+          type: object
+          additionalProperties: {type: string}
+security:
+  - bearer: []

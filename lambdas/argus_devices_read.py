@@ -1,4 +1,6 @@
 import json
+from datetime import datetime, timezone
+from http.client import responses
 import os
 
 import boto3
@@ -12,6 +14,14 @@ def resp(status, corpo):
             "headers": {"content-type": "application/json",
                         "cache-control": "no-store"},
             "body": json.dumps(corpo)}
+
+
+def erro(status, mensagem, caminho, campos=None):
+    """Erro no formato ApiError da spec (openapi/openapi.yaml)."""
+    return resp(status, {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "status": status, "error": responses.get(status, "Error"),
+        "message": mensagem, "path": caminho, "fields": campos or {}})
 
 
 def molda(item):
@@ -28,9 +38,10 @@ def molda(item):
 
 def handler(event, context):
     rota = event.get("routeKey", "")
+    caminho_url = event.get("rawPath", rota)
     caminho = event.get("pathParameters") or {}
 
-    if rota == "GET /api/devices":
+    if rota == "GET /v1/devices":
         # Metadados numa particao unica: listar e uma Query, nao um Scan nem
         # N chamadas ao IoT. A particao cresce com a frota, nao com o dado.
         itens, proxima = [], None
@@ -45,11 +56,11 @@ def handler(event, context):
                 break
         return resp(200, [molda(i) for i in itens])
 
-    if rota == "GET /api/devices/{code}":
+    if rota == "GET /v1/devices/{code}":
         codigo = caminho.get("code")
         r = TABELA.get_item(Key={"pk": "DEVICEMETA", "sk": codigo})
         if "Item" not in r:
-            return resp(404, {"message": f"device {codigo} nao existe"})
+            return erro(404, f"device {codigo} nao existe", caminho_url)
         return resp(200, molda(r["Item"]))
 
-    return resp(404, {"message": "rota desconhecida"})
+    return erro(404, "rota desconhecida", caminho_url)

@@ -12,8 +12,12 @@ check:  ## nao altera nada; e o que o CI roda
 	python3 -m compileall -q glue lambdas
 	python3 tests/test_geohash.py
 	python3 tests/test_argus_handlers.py
+	python3 tools/check_spec_routes.py
 
 test: check
 
 clean:
 	find . -name __pycache__ -type d -prune -exec rm -rf {} +
+
+spec-check:  ## rotas do gateway batem 1:1 com openapi/openapi.yaml
+	python3 tools/check_spec_routes.py

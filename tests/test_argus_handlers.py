@@ -253,16 +253,16 @@ def evento(rota, caminho=None, corpo=None, q=None, papel=None):
 
 
 # -------------------------------------------------------------------- auth
-r = auth(evento("POST /auth/login",
+r = auth(evento("POST /v1/auth/login",
                 corpo={"email": "admin@x.com", "password": "senha-certa-123"}), None)
 corpo = json.loads(r["body"])
 checa("auth: login -> TokenResponse",
       sorted(corpo), ["accessToken", "expiresIn", "refreshToken"])
 checa("auth: accessToken e o ID token", corpo["accessToken"], "ID.TOKEN")
 checa("auth: senha errada -> 401",
-      auth(evento("POST /auth/login",
+      auth(evento("POST /v1/auth/login",
                   corpo={"email": "admin@x.com", "password": "x"}), None)["statusCode"], 401)
-r = auth(evento("POST /auth/refresh", corpo={"refreshToken": "REFRESH"}), None)
+r = auth(evento("POST /v1/auth/refresh", corpo={"refreshToken": "REFRESH"}), None)
 corpo = json.loads(r["body"])
 checa("auth: refresh reusa o refresh token", corpo["refreshToken"], "REFRESH")
 
@@ -278,33 +278,38 @@ checa("pretoken: sem grupo vira VIEWER",
       {"role": "VIEWER"})
 
 # ----------------------------------------------------------------- devices
-r = dev_write(evento("POST /api/devices",
+r = dev_write(evento("POST /v1/devices",
                      corpo={"code": "trator-07", "label": "John Deere 6110"}), None)
 corpo = json.loads(r["body"])
 checa("devices: criacao -> 201", r["statusCode"], 201)
-checa("devices: DeviceCreated com device e key",
-      sorted(corpo), ["device", "key"])
+checa("devices: DeviceCreated com device e credentials",
+      sorted(corpo), ["credentials", "device"])
 checa("devices: label com espaco preservado",
       corpo["device"]["label"], "John Deere 6110")
-checa("devices: key carrega chave, cert e endpoint",
-      all(t in corpo["key"] for t in ("KEY-PEM", "CERT-PEM", "endpoint")), True)
+cred = corpo["credentials"]
+checa("devices: credenciais estruturadas",
+      (cred["privateKeyPem"], cred["certificatePem"], cred["clientId"]),
+      ("KEY-PEM", "CERT-PEM", "trator-07"))
+checa("devices: endpoint e topicos nas credenciais",
+      (cred["mqttEndpoint"].endswith("amazonaws.com"),
+       cred["topics"]["position"]), (True, "devices/trator-07/position"))
 checa("devices: ativo ao nascer", corpo["device"]["active"], True)
 checa("devices: duplicado -> 409",
-      dev_write(evento("POST /api/devices",
+      dev_write(evento("POST /v1/devices",
                        corpo={"code": "trator-07", "label": "x"}), None)["statusCode"], 409)
 
-lista = json.loads(dev_read(evento("GET /api/devices"), None)["body"])
+lista = json.loads(dev_read(evento("GET /v1/devices"), None)["body"])
 checa("devices: lista no formato DeviceResponse",
       [d["code"] for d in lista], ["trator-07"])
-um = json.loads(dev_read(evento("GET /api/devices/{code}",
+um = json.loads(dev_read(evento("GET /v1/devices/{code}",
                                 {"code": "trator-07"}), None)["body"])
 checa("devices: detalhe", um["code"], "trator-07")
 checa("devices: inexistente -> 404",
-      dev_read(evento("GET /api/devices/{code}",
+      dev_read(evento("GET /v1/devices/{code}",
                       {"code": "nao-ha"}), None)["statusCode"], 404)
 
 iot_fake.chamadas = []
-r = dev_write(evento("DELETE /api/devices/{code}/key",
+r = dev_write(evento("DELETE /v1/devices/{code}/credentials",
                      {"code": "trator-07"}), None)
 corpo = json.loads(r["body"])
 checa("devices: revogacao desativa ANTES de desanexar e apagar",
@@ -320,47 +325,56 @@ tabela_fake.put_item(Item={"pk": "DEV#trator-07#position", "sk": "LATEST",
                            "lat": Decimal("-21.17"), "lon": Decimal("-47.81"),
                            "speed": Decimal("7.2"), "heading": Decimal("90"),
                            "received_at": "2026-08-28T12:00:03Z"})
-r = json.loads(locs(evento("GET /api/locations/latest"), None)["body"])
+r = json.loads(locs(evento("GET /v1/locations/latest"), None)["body"])
 checa("locations: latest no formato LocationResponse",
       (r[0]["deviceCode"], r[0]["lat"], r[0]["speedMps"], r[0]["courseDeg"]),
       ("trator-07", -21.17, 2.0, 90.0))
 checa("locations: receivedAt preservado", r[0]["receivedAt"], "2026-08-28T12:00:03Z")
 
+tabela_fake.put_item(Item={"pk": "DEVICEMETA", "sk": "trator-07",
+                           "label": "x", "active": True})
 for i in range(5):
     tabela_fake.put_item(Item={"pk": "TRACK#trator-07",
                                "sk": f"2026-08-28T12:00:{i:02d}Z#00000{i}",
                                "ts": f"2026-08-28T12:00:{i:02d}Z",
                                "lat": Decimal("-21.17"), "lon": Decimal("-47.81")})
-r = json.loads(locs(evento("GET /api/locations",
-                           q={"device": "trator-07", "limit": "2"}), None)["body"])
+r = json.loads(locs(evento("GET /v1/devices/{code}/locations",
+                           caminho={"code": "trator-07"},
+                           q={"limit": "2"}), None)["body"])
 checa("locations: pagina mais recente primeiro",
       [i["ts"][-3:-1] for i in r["items"]], ["04", "03"])
 checa("locations: cursor keyset presente", r["nextCursor"] is not None, True)
-r2 = json.loads(locs(evento("GET /api/locations",
-                            q={"device": "trator-07", "limit": "2",
-                               "to": r["nextCursor"]}), None)["body"])
+r2 = json.loads(locs(evento("GET /v1/devices/{code}/locations",
+                            caminho={"code": "trator-07"},
+                            q={"limit": "2", "to": r["nextCursor"]}), None)["body"])
 checa("locations: pagina seguinte nao repete o cursor",
       [i["ts"][-3:-1] for i in r2["items"]], ["02", "01"])
-checa("locations: sem device -> 400",
-      locs(evento("GET /api/locations"), None)["statusCode"], 400)
+checa("locations: device desconhecido -> 404",
+      locs(evento("GET /v1/devices/{code}/locations",
+                  caminho={"code": "fantasma"}), None)["statusCode"], 404)
 
 # ------------------------------------------------------------------- users
 checa("users: sem ADMIN -> 403",
-      users(evento("GET /api/users", papel="OPERATOR"), None)["statusCode"], 403)
-r = users(evento("POST /api/users", papel="ADMIN",
+      users(evento("GET /v1/users", papel="OPERATOR"), None)["statusCode"], 403)
+r = users(evento("POST /v1/users", papel="ADMIN",
                  corpo={"email": "op@x.com", "password": "SenhaForte-123",
                         "name": "Operadora", "role": "OPERATOR"}), None)
 corpo = json.loads(r["body"])
 checa("users: criacao -> 201 no formato UserResponse",
       (corpo["email"], corpo["name"], corpo["role"]),
       ("op@x.com", "Operadora", "OPERATOR"))
-lista = json.loads(users(evento("GET /api/users", papel="ADMIN"), None)["body"])
+lista = json.loads(users(evento("GET /v1/users", papel="ADMIN"), None)["body"])
 checa("users: lista com papel resolvido do grupo",
       [(u["email"], u["role"]) for u in lista], [("op@x.com", "OPERATOR")])
-checa("users: papel invalido -> 400",
-      users(evento("POST /api/users", papel="ADMIN",
-                   corpo={"email": "a@x.com", "password": "SenhaForte-123",
-                          "name": "A", "role": "ROOT"}), None)["statusCode"], 400)
+r = users(evento("POST /v1/users", papel="ADMIN",
+                 corpo={"email": "a@x.com", "password": "SenhaForte-123",
+                        "name": "A", "role": "ROOT"}), None)
+corpo = json.loads(r["body"])
+checa("users: papel invalido -> 400", r["statusCode"], 400)
+checa("erros: ApiError completo da spec",
+      sorted(corpo), ["error", "fields", "message", "path", "status", "timestamp"])
+checa("erros: error nomeado pela stdlib", corpo["error"], "Bad Request")
+checa("erros: fields aponta o campo", "role" in corpo["fields"], True)
 
 print("\n=> todos os casos passaram" if not falhas else f"\n=> {len(falhas)} FALHA(S)")
 sys.exit(1 if falhas else 0)

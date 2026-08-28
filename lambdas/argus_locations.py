@@ -1,6 +1,7 @@
 import json
 import os
 from datetime import datetime, timezone
+from http.client import responses
 
 import boto3
 from boto3.dynamodb.conditions import Key
@@ -14,6 +15,14 @@ def resp(status, corpo):
             "headers": {"content-type": "application/json",
                         "cache-control": "no-store"},
             "body": json.dumps(corpo)}
+
+
+def erro(status, mensagem, caminho, campos=None):
+    """Erro no formato ApiError da spec (openapi/openapi.yaml)."""
+    return resp(status, {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "status": status, "error": responses.get(status, "Error"),
+        "message": mensagem, "path": caminho, "fields": campos or {}})
 
 
 def molda(codigo, item):
@@ -41,9 +50,10 @@ def molda(codigo, item):
 
 def handler(event, context):
     rota = event.get("routeKey", "")
+    caminho_url = event.get("rawPath", rota)
     q = event.get("queryStringParameters") or {}
 
-    if rota == "GET /api/locations/latest":
+    if rota == "GET /v1/locations/latest":
         # DEVICEMETA lista a frota; um GetItem por device pega o LATEST que a
         # ingestao mantem. Custo acompanha o tamanho da frota.
         frota = TABELA.query(
@@ -58,10 +68,11 @@ def handler(event, context):
                 saida.append(molda(meta["sk"], r["Item"]))
         return resp(200, saida)
 
-    if rota == "GET /api/locations":
-        codigo = q.get("device")
-        if not codigo:
-            return resp(400, {"message": "device obrigatorio"})
+    if rota == "GET /v1/devices/{code}/locations":
+        codigo = (event.get("pathParameters") or {}).get("code")
+        if "Item" not in TABELA.get_item(
+                Key={"pk": "DEVICEMETA", "sk": codigo}):
+            return erro(404, f"device {codigo} nao existe", caminho_url)
         limite = min(int(q.get("limit") or 100), LIMITE_MAX)
         cond = Key("pk").eq(f"TRACK#{codigo}")
         de, ate = q.get("from"), q.get("to")
@@ -86,4 +97,4 @@ def handler(event, context):
                   if linhas and pagina.get("LastEvaluatedKey") else None)
         return resp(200, {"items": itens, "nextCursor": cursor})
 
-    return resp(404, {"message": "rota desconhecida"})
+    return erro(404, "rota desconhecida", caminho_url)

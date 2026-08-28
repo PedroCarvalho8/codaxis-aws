@@ -32,3 +32,6 @@ jobs:
 
       - name: handlers do contrato argus
         run: python3 tests/test_argus_handlers.py
+
+      - name: rotas batem com a spec
+        run: python3 tools/check_spec_routes.py

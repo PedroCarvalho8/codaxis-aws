@@ -1612,9 +1612,8 @@ Resources:
   # ---------------------------------------------------------------------------
   # API do argus - autenticacao, frota, localizacoes e usuarios
   #
-  # As rotas espelham o contrato OpenAPI que o webapp argus consome
-  # (github.com/PedroDaniluz/argus-webapp): /auth/*, /api/devices,
-  # /api/locations e /api/users, com os mesmos formatos de resposta.
+  # O contrato e DEFINIDO por este backend, em openapi/openapi.yaml -- os
+  # handlers implementam a spec, e clients (o argus-webapp) sao gerados dela.
   # ---------------------------------------------------------------------------
 
   # Uma UNICA policy para toda a frota, com variaveis de politica do IoT:
@@ -1777,6 +1776,8 @@ Resources:
       Code:
         ZipFile: |
           import json
+          from datetime import datetime, timezone
+          from http.client import responses
           import os
 
           import boto3
@@ -1790,6 +1791,14 @@ Resources:
                       "headers": {"content-type": "application/json",
                                   "cache-control": "no-store"},
                       "body": json.dumps(corpo)}
+
+
+          def erro(status, mensagem, caminho, campos=None):
+              """Erro no formato ApiError da spec (openapi/openapi.yaml)."""
+              return resp(status, {
+                  "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  "status": status, "error": responses.get(status, "Error"),
+                  "message": mensagem, "path": caminho, "fields": campos or {}})
 
 
           def tokens(resultado, refresh_atual=None):
@@ -1814,15 +1823,16 @@ Resources:
               try:
                   corpo = json.loads(event.get("body") or "{}")
               except ValueError:
-                  return resp(400, {"message": "body invalido"})
+                  return erro(400, "body invalido", event.get("rawPath", ""))
               rota = event.get("routeKey", "")
+              caminho = event.get("rawPath", rota)
 
               try:
-                  if rota == "POST /auth/login":
+                  if rota == "POST /v1/auth/login":
                       email = corpo.get("email") or ""
                       senha = corpo.get("password") or ""
                       if not email or not senha:
-                          return resp(400, {"message": "email e password obrigatorios"})
+                          return erro(400, "email e password obrigatorios", caminho)
                       r = idp.initiate_auth(
                           ClientId=CLIENT_ID,
                           AuthFlow="USER_PASSWORD_AUTH",
@@ -1831,13 +1841,13 @@ Resources:
                       if "AuthenticationResult" not in r:
                           # NEW_PASSWORD_REQUIRED etc.: fluxo de desafio nao suportado
                           # pela API; o operador finaliza o cadastro pela CLI.
-                          return resp(409, {"message": f"desafio pendente: {r.get('ChallengeName')}"})
+                          return erro(409, f"desafio pendente: {r.get('ChallengeName')}", caminho)
                       return resp(200, tokens(r))
 
-                  if rota == "POST /auth/refresh":
+                  if rota == "POST /v1/auth/refresh":
                       atual = corpo.get("refreshToken") or ""
                       if not atual:
-                          return resp(400, {"message": "refreshToken obrigatorio"})
+                          return erro(400, "refreshToken obrigatorio", caminho)
                       r = idp.initiate_auth(
                           ClientId=CLIENT_ID,
                           AuthFlow="REFRESH_TOKEN_AUTH",
@@ -1846,9 +1856,9 @@ Resources:
                       return resp(200, tokens(r, refresh_atual=atual))
               except (idp.exceptions.NotAuthorizedException,
                       idp.exceptions.UserNotFoundException):
-                  return resp(401, {"message": "credenciais invalidas"})
+                  return erro(401, "credenciais invalidas", caminho)
 
-              return resp(404, {"message": "rota desconhecida"})
+              return erro(404, "rota desconhecida", caminho)
 
   AuthRole:
     Type: AWS::IAM::Role
@@ -1886,6 +1896,8 @@ Resources:
       Code:
         ZipFile: |
           import json
+          from datetime import datetime, timezone
+          from http.client import responses
           import os
 
           import boto3
@@ -1899,6 +1911,14 @@ Resources:
                       "headers": {"content-type": "application/json",
                                   "cache-control": "no-store"},
                       "body": json.dumps(corpo)}
+
+
+          def erro(status, mensagem, caminho, campos=None):
+              """Erro no formato ApiError da spec (openapi/openapi.yaml)."""
+              return resp(status, {
+                  "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  "status": status, "error": responses.get(status, "Error"),
+                  "message": mensagem, "path": caminho, "fields": campos or {}})
 
 
           def molda(item):
@@ -1915,9 +1935,10 @@ Resources:
 
           def handler(event, context):
               rota = event.get("routeKey", "")
+              caminho_url = event.get("rawPath", rota)
               caminho = event.get("pathParameters") or {}
 
-              if rota == "GET /api/devices":
+              if rota == "GET /v1/devices":
                   # Metadados numa particao unica: listar e uma Query, nao um Scan nem
                   # N chamadas ao IoT. A particao cresce com a frota, nao com o dado.
                   itens, proxima = [], None
@@ -1932,14 +1953,14 @@ Resources:
                           break
                   return resp(200, [molda(i) for i in itens])
 
-              if rota == "GET /api/devices/{code}":
+              if rota == "GET /v1/devices/{code}":
                   codigo = caminho.get("code")
                   r = TABELA.get_item(Key={"pk": "DEVICEMETA", "sk": codigo})
                   if "Item" not in r:
-                      return resp(404, {"message": f"device {codigo} nao existe"})
+                      return erro(404, f"device {codigo} nao existe", caminho_url)
                   return resp(200, molda(r["Item"]))
 
-              return resp(404, {"message": "rota desconhecida"})
+              return erro(404, "rota desconhecida", caminho_url)
 
   DevicesReadRole:
     Type: AWS::IAM::Role
@@ -1983,13 +2004,14 @@ Resources:
           import os
           import re
           from datetime import datetime, timezone
+          from http.client import responses
 
           import boto3
 
           iot = boto3.client("iot")
           TABELA = boto3.resource("dynamodb").Table(os.environ["TABLE"])
           POLICY = os.environ["DEVICE_POLICY"]
-          CODIGO_OK = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
+          COD_OK = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
 
 
           def resp(status, corpo):
@@ -1999,69 +2021,78 @@ Resources:
                       "body": json.dumps(corpo)}
 
 
+          def erro(status, mensagem, caminho, campos=None):
+              return resp(status, {
+                  "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  "status": status, "error": responses.get(status, "Error"),
+                  "message": mensagem, "path": caminho, "fields": campos or {}})
+
+
           def agora():
               return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-          def molda(item):
-              return {"id": item["sk"], "code": item["sk"],
-                      "label": item.get("label") or "",
-                      "createdAt": item.get("created_at"),
-                      "revokedAt": item.get("revoked_at"),
-                      "active": bool(item.get("active"))}
+          def molda(i):
+              return {"id": i["sk"], "code": i["sk"], "label": i.get("label") or "",
+                      "createdAt": i.get("created_at"),
+                      "revokedAt": i.get("revoked_at"), "active": bool(i.get("active"))}
 
 
           def handler(event, context):
               rota = event.get("routeKey", "")
+              caminho_url = event.get("rawPath", rota)
               caminho = event.get("pathParameters") or {}
               codigo = caminho.get("code")
               try:
                   corpo = json.loads(event.get("body") or "{}")
               except ValueError:
-                  return resp(400, {"message": "body invalido"})
+                  return erro(400, "body invalido", event.get("rawPath", ""))
 
-              if rota == "POST /api/devices":
+              if rota == "POST /v1/devices":
                   codigo = corpo.get("code") or ""
                   rotulo = (corpo.get("label") or "").strip()
-                  if not CODIGO_OK.match(codigo):
-                      return resp(400, {"message": "code: [a-zA-Z0-9_-]{1,128}"})
+                  if not COD_OK.match(codigo):
+                      return erro(400, "code invalido", caminho_url,
+                                  {"code": "[a-zA-Z0-9_-]{1,128}"})
                   if not rotulo:
-                      return resp(400, {"message": "label obrigatorio"})
+                      return erro(400, "label obrigatorio", caminho_url,
+                                  {"label": "obrigatorio"})
                   try:
                       iot.create_thing(thingName=codigo)
                   except iot.exceptions.ResourceAlreadyExistsException:
-                      return resp(409, {"message": f"device {codigo} ja existe"})
+                      return erro(409, f"device {codigo} ja existe", caminho_url)
                   cert = iot.create_keys_and_certificate(setAsActive=True)
                   iot.attach_policy(policyName=POLICY, target=cert["certificateArn"])
                   iot.attach_thing_principal(
                       thingName=codigo, principal=cert["certificateArn"]
                   )
-                  # Label vive aqui, nao em atributo do thing: atributo de thing nao
-                  # aceita espaco, e rotulo humano tem espaco.
+                  # Label no DynamoDB: atributo de thing nao aceita espaco.
                   item = {"pk": "DEVICEMETA", "sk": codigo, "label": rotulo,
                           "created_at": agora(), "revoked_at": None, "active": True}
                   TABELA.put_item(Item=item)
                   ep = iot.describe_endpoint(
                       endpointType="iot:Data-ATS"
                   )["endpointAddress"]
-                  # O contrato tem UM campo de segredo. O bundle vai inteiro nele:
-                  # chave privada + certificado + endpoint, mostrado uma unica vez.
-                  chave = (f"# endpoint: {ep}\n# client id: {codigo}\n"
-                           f"{cert['keyPair']['PrivateKey']}\n{cert['certificatePem']}")
-                  return resp(201, {"device": molda(item), "key": chave})
+                  # Mostradas UMA vez: a chave privada nao fica armazenada.
+                  return resp(201, {"device": molda(item), "credentials": {
+                      "privateKeyPem": cert["keyPair"]["PrivateKey"],
+                      "certificatePem": cert["certificatePem"],
+                      "mqttEndpoint": ep,
+                      "clientId": codigo,
+                      "topics": {"telemetry": f"devices/{codigo}/telemetry",
+                                 "position": f"devices/{codigo}/position"}}})
 
-              if rota == "DELETE /api/devices/{code}/key":
+              if rota == "DELETE /v1/devices/{code}/credentials":
                   r = TABELA.get_item(Key={"pk": "DEVICEMETA", "sk": codigo})
                   if "Item" not in r:
-                      return resp(404, {"message": f"device {codigo} nao existe"})
+                      return erro(404, f"device {codigo} nao existe", caminho_url)
                   try:
                       arns = iot.list_thing_principals(thingName=codigo)["principals"]
                   except iot.exceptions.ResourceNotFoundException:
                       arns = []
                   for arn in arns:
                       cid = arn.split("/")[-1]
-                      # Desativa antes de tudo: derruba a conexao mesmo se um passo
-                      # seguinte falhar.
+                      # Desativa primeiro: derruba a conexao mesmo se algo falhar.
                       iot.update_certificate(certificateId=cid, newStatus="INACTIVE")
                       iot.detach_policy(policyName=POLICY, target=arn)
                       iot.detach_thing_principal(thingName=codigo, principal=arn)
@@ -2070,7 +2101,7 @@ Resources:
                   TABELA.put_item(Item=item)
                   return resp(200, molda(item))
 
-              return resp(404, {"message": "rota desconhecida"})
+              return erro(404, "rota desconhecida", caminho_url)
 
   DevicesWriteRole:
     Type: AWS::IAM::Role
@@ -2136,6 +2167,7 @@ Resources:
           import json
           import os
           from datetime import datetime, timezone
+          from http.client import responses
 
           import boto3
           from boto3.dynamodb.conditions import Key
@@ -2149,6 +2181,14 @@ Resources:
                       "headers": {"content-type": "application/json",
                                   "cache-control": "no-store"},
                       "body": json.dumps(corpo)}
+
+
+          def erro(status, mensagem, caminho, campos=None):
+              """Erro no formato ApiError da spec (openapi/openapi.yaml)."""
+              return resp(status, {
+                  "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  "status": status, "error": responses.get(status, "Error"),
+                  "message": mensagem, "path": caminho, "fields": campos or {}})
 
 
           def molda(codigo, item):
@@ -2176,9 +2216,10 @@ Resources:
 
           def handler(event, context):
               rota = event.get("routeKey", "")
+              caminho_url = event.get("rawPath", rota)
               q = event.get("queryStringParameters") or {}
 
-              if rota == "GET /api/locations/latest":
+              if rota == "GET /v1/locations/latest":
                   # DEVICEMETA lista a frota; um GetItem por device pega o LATEST que a
                   # ingestao mantem. Custo acompanha o tamanho da frota.
                   frota = TABELA.query(
@@ -2193,10 +2234,11 @@ Resources:
                           saida.append(molda(meta["sk"], r["Item"]))
                   return resp(200, saida)
 
-              if rota == "GET /api/locations":
-                  codigo = q.get("device")
-                  if not codigo:
-                      return resp(400, {"message": "device obrigatorio"})
+              if rota == "GET /v1/devices/{code}/locations":
+                  codigo = (event.get("pathParameters") or {}).get("code")
+                  if "Item" not in TABELA.get_item(
+                          Key={"pk": "DEVICEMETA", "sk": codigo}):
+                      return erro(404, f"device {codigo} nao existe", caminho_url)
                   limite = min(int(q.get("limit") or 100), LIMITE_MAX)
                   cond = Key("pk").eq(f"TRACK#{codigo}")
                   de, ate = q.get("from"), q.get("to")
@@ -2221,7 +2263,7 @@ Resources:
                             if linhas and pagina.get("LastEvaluatedKey") else None)
                   return resp(200, {"items": itens, "nextCursor": cursor})
 
-              return resp(404, {"message": "rota desconhecida"})
+              return erro(404, "rota desconhecida", caminho_url)
 
   UsersFunction:
     Type: AWS::Lambda::Function
@@ -2238,6 +2280,8 @@ Resources:
       Code:
         ZipFile: |
           import json
+          from datetime import datetime, timezone
+          from http.client import responses
           import os
 
           import boto3
@@ -2252,6 +2296,14 @@ Resources:
                       "headers": {"content-type": "application/json",
                                   "cache-control": "no-store"},
                       "body": json.dumps(corpo)}
+
+
+          def erro(status, mensagem, caminho, campos=None):
+              """Erro no formato ApiError da spec (openapi/openapi.yaml)."""
+              return resp(status, {
+                  "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  "status": status, "error": responses.get(status, "Error"),
+                  "message": mensagem, "path": caminho, "fields": campos or {}})
 
 
           def papel_de(claims):
@@ -2281,15 +2333,17 @@ Resources:
               # So ADMIN gere usuarios -- mesmo criterio que o webapp usa para exibir a
               # tela, mas imposto aqui, onde vale.
               if papel_de(claims) != "ADMIN":
-                  return resp(403, {"message": "apenas ADMIN gere usuarios"})
+                  return erro(403, "apenas ADMIN gere usuarios",
+                              event.get("rawPath", ""))
 
               rota = event.get("routeKey", "")
+              caminho_url = event.get("rawPath", rota)
               try:
                   corpo = json.loads(event.get("body") or "{}")
               except ValueError:
-                  return resp(400, {"message": "body invalido"})
+                  return erro(400, "body invalido", caminho_url)
 
-              if rota == "GET /api/users":
+              if rota == "GET /v1/users":
                   saida = []
                   for u in idp.list_users(UserPoolId=POOL, Limit=60)["Users"]:
                       grupos = idp.admin_list_groups_for_user(
@@ -2300,15 +2354,16 @@ Resources:
                       saida.append(molda(u, papel))
                   return resp(200, saida)
 
-              if rota == "POST /api/users":
+              if rota == "POST /v1/users":
                   email = corpo.get("email") or ""
                   senha = corpo.get("password") or ""
                   nome = (corpo.get("name") or "").strip()
                   papel = corpo.get("role") or "VIEWER"
                   if not email or not senha or not nome:
-                      return resp(400, {"message": "email, password e name obrigatorios"})
+                      return erro(400, "email, password e name obrigatorios", caminho_url)
                   if papel not in PAPEIS:
-                      return resp(400, {"message": f"role: {'|'.join(PAPEIS)}"})
+                      return erro(400, f"role: {'|'.join(PAPEIS)}", caminho_url,
+                                  {"role": "|".join(PAPEIS)})
                   try:
                       idp.admin_create_user(
                           UserPoolId=POOL, Username=email, MessageAction="SUPPRESS",
@@ -2319,7 +2374,7 @@ Resources:
                           ],
                       )
                   except idp.exceptions.UsernameExistsException:
-                      return resp(409, {"message": f"{email} ja existe"})
+                      return erro(409, f"{email} ja existe", caminho_url)
                   idp.admin_set_user_password(
                       UserPoolId=POOL, Username=email, Password=senha, Permanent=True
                   )
@@ -2329,7 +2384,7 @@ Resources:
                   u = idp.admin_get_user(UserPoolId=POOL, Username=email)
                   return resp(201, molda(u, papel))
 
-              return resp(404, {"message": "rota desconhecida"})
+              return erro(404, "rota desconhecida", caminho_url)
 
   UsersRole:
     Type: AWS::IAM::Role
@@ -2405,21 +2460,21 @@ Resources:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'POST /auth/login'
+      RouteKey: 'POST /v1/auth/login'
       Target: !Sub 'integrations/${AuthIntegration}'
 
   RefreshRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'POST /auth/refresh'
+      RouteKey: 'POST /v1/auth/refresh'
       Target: !Sub 'integrations/${AuthIntegration}'
 
   DevicesListRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'GET /api/devices'
+      RouteKey: 'GET /v1/devices'
       AuthorizationType: JWT
       AuthorizerId: !Ref ArgusAuthorizer
       Target: !Sub 'integrations/${DevicesReadIntegration}'
@@ -2428,7 +2483,7 @@ Resources:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'GET /api/devices/{code}'
+      RouteKey: 'GET /v1/devices/{code}'
       AuthorizationType: JWT
       AuthorizerId: !Ref ArgusAuthorizer
       Target: !Sub 'integrations/${DevicesReadIntegration}'
@@ -2437,7 +2492,7 @@ Resources:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'POST /api/devices'
+      RouteKey: 'POST /v1/devices'
       AuthorizationType: JWT
       AuthorizerId: !Ref ArgusAuthorizer
       Target: !Sub 'integrations/${DevicesWriteIntegration}'
@@ -2446,7 +2501,7 @@ Resources:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'DELETE /api/devices/{code}/key'
+      RouteKey: 'DELETE /v1/devices/{code}/credentials'
       AuthorizationType: JWT
       AuthorizerId: !Ref ArgusAuthorizer
       Target: !Sub 'integrations/${DevicesWriteIntegration}'
@@ -2455,7 +2510,7 @@ Resources:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'GET /api/locations'
+      RouteKey: 'GET /v1/devices/{code}/locations'
       AuthorizationType: JWT
       AuthorizerId: !Ref ArgusAuthorizer
       Target: !Sub 'integrations/${LocationsIntegration}'
@@ -2464,7 +2519,7 @@ Resources:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'GET /api/locations/latest'
+      RouteKey: 'GET /v1/locations/latest'
       AuthorizationType: JWT
       AuthorizerId: !Ref ArgusAuthorizer
       Target: !Sub 'integrations/${LocationsIntegration}'
@@ -2473,7 +2528,7 @@ Resources:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'GET /api/users'
+      RouteKey: 'GET /v1/users'
       AuthorizationType: JWT
       AuthorizerId: !Ref ArgusAuthorizer
       Target: !Sub 'integrations/${UsersIntegration}'
@@ -2482,7 +2537,7 @@ Resources:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'POST /api/users'
+      RouteKey: 'POST /v1/users'
       AuthorizationType: JWT
       AuthorizerId: !Ref ArgusAuthorizer
       Target: !Sub 'integrations/${UsersIntegration}'
