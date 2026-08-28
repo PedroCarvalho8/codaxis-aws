@@ -1,0 +1,316 @@
+  # ---------------------------------------------------------------------------
+  # Gestao de devices - provisionamento no IoT Core via API
+  #
+  # Uma UNICA policy para toda a frota, com variaveis de politica do IoT:
+  # ${iot:Connection.Thing.ThingName} resolve para o thing anexado ao
+  # certificado na conexao. O certificado do trator-07 so conecta como
+  # trator-07 e so publica nos topicos do trator-07 -- sem uma policy por
+  # device para gerenciar, e sem como um device publicar no lugar de outro.
+  #
+  # Privilegio minimo de verdade: nao ha Subscribe nem Receive. O device desta
+  # pilha e um emissor de telemetria; se um dia precisar receber comando, a
+  # permissao nasce ai, nao antes.
+  # ---------------------------------------------------------------------------
+
+  DevicePolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-device'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: iot:Connect
+            Resource: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:client/${!iot:Connection.Thing.ThingName}'
+            Condition:
+              Bool:
+                iot:Connection.Thing.IsAttached: ['true']
+          - Effect: Allow
+            Action: iot:Publish
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topic/devices/${!iot:Connection.Thing.ThingName}/telemetry'
+              - !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topic/devices/${!iot:Connection.Thing.ThingName}/position'
+              # Basic ingest: publicar direto no Rules Engine pula o broker e
+              # a cobranca de mensageria. O conteudo continua carregando o
+              # device_id, e a chave e o certificado continuam por device.
+              - !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/rules/${TelemetryTopicRule}'
+              - !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/rules/${PositionTopicRule}'
+
+  # Leitura da frota: listar e inspecionar devices e certificados.
+  AdminReadFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-admin-read'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt AdminReadRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          {{ include: lambdas/admin_devices_read.py }}
+
+  # Escrita: criar device + certificado, rotacionar, ativar/desativar, revogar.
+  AdminWriteFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-admin-write'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt AdminWriteRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          DEVICE_POLICY: !Ref DevicePolicy
+      Code:
+        ZipFile: |
+          {{ include: lambdas/admin_devices_write.py }}
+
+  # A chave de admin vive num SecureString do Parameter Store, criado fora da
+  # pilha -- nem em parametro do CloudFormation nem no deployment file, porque
+  # este repositorio e publico e o Git sync leria a chave dali.
+  AdminKeyReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: ssm:GetParameter
+            Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/admin/api-key'
+          - Effect: Allow
+            Action: kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub 'ssm.${AWS::Region}.amazonaws.com'
+
+  AdminReadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: le-frota
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iot:ListThings
+                  - iot:DescribeEndpoint
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iot:DescribeThing
+                  - iot:ListThingPrincipals
+                Resource: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:thing/*'
+              - Effect: Allow
+                Action: iot:DescribeCertificate
+                Resource: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:cert/*'
+
+  AdminWriteRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: provisiona-frota
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CreateKeysAndCertificate e DescribeEndpoint nao aceitam
+              # escopo de recurso.
+              - Effect: Allow
+                Action:
+                  - iot:CreateKeysAndCertificate
+                  - iot:DescribeEndpoint
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iot:CreateThing
+                  - iot:DescribeThing
+                  - iot:DeleteThing
+                  - iot:AttachThingPrincipal
+                  - iot:DetachThingPrincipal
+                  - iot:ListThingPrincipals
+                Resource: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:thing/*'
+              - Effect: Allow
+                Action:
+                  - iot:DescribeCertificate
+                  - iot:UpdateCertificate
+                  - iot:DeleteCertificate
+                  - iot:AttachPolicy
+                  - iot:DetachPolicy
+                Resource: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:cert/*'
+              # AttachPolicy/DetachPolicy validam tambem a policy alvo.
+              - Effect: Allow
+                Action:
+                  - iot:AttachPolicy
+                  - iot:DetachPolicy
+                Resource: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:policy/${DevicePolicy}'
+
+  # A chave de admin e comparada AQUI, no gateway, antes de qualquer Lambda
+  # de negocio ser invocada. Header x-api-key contra o SecureString do SSM.
+  AdminAuthorizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-admin-authorizer'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt AdminAuthorizerRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          ADMIN_KEY_PARAM: !Sub '/${ProjectName}/admin/api-key'
+      Code:
+        ZipFile: |
+          {{ include: lambdas/admin_authorizer.py }}
+
+  AdminAuthorizerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !Ref AdminKeyReadPolicy
+
+  AdminAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref RollupApi
+      Name: !Sub '${ProjectName}-admin-key'
+      AuthorizerType: REQUEST
+      AuthorizerPayloadFormatVersion: '2.0'
+      EnableSimpleResponses: true
+      AuthorizerUri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminAuthorizerFunction.Arn}/invocations'
+      IdentitySource:
+        - '$request.header.x-api-key'
+      # Cache por valor de chave: rotacao demora ate isto para valer no
+      # gateway; o proprio authorizer ja recarrega o SSM a cada erro.
+      AuthorizerResultTtlInSeconds: 60
+
+  AdminAuthorizerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AdminAuthorizerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
+
+  AdminReadIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RollupApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AdminReadFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  AdminWriteIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RollupApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AdminWriteFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  AdminListRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'GET /admin/devices'
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref AdminAuthorizer
+      Target: !Sub 'integrations/${AdminReadIntegration}'
+
+  AdminDetailRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'GET /admin/devices/{device_id}'
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref AdminAuthorizer
+      Target: !Sub 'integrations/${AdminReadIntegration}'
+
+  AdminCreateRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'POST /admin/devices'
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref AdminAuthorizer
+      Target: !Sub 'integrations/${AdminWriteIntegration}'
+
+  AdminRotateRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'POST /admin/devices/{device_id}/certificates'
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref AdminAuthorizer
+      Target: !Sub 'integrations/${AdminWriteIntegration}'
+
+  AdminCertStatusRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'PATCH /admin/devices/{device_id}/certificates/{certificate_id}'
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref AdminAuthorizer
+      Target: !Sub 'integrations/${AdminWriteIntegration}'
+
+  AdminRevokeCertRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'DELETE /admin/devices/{device_id}/certificates/{certificate_id}'
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref AdminAuthorizer
+      Target: !Sub 'integrations/${AdminWriteIntegration}'
+
+  AdminDeleteDeviceRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RollupApi
+      RouteKey: 'DELETE /admin/devices/{device_id}'
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref AdminAuthorizer
+      Target: !Sub 'integrations/${AdminWriteIntegration}'
+
+  AdminReadInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AdminReadFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
+
+  AdminWriteInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AdminWriteFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'

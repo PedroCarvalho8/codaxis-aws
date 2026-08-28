@@ -1,9 +1,14 @@
 # Pipeline de ingestão IoT — IoT Core → Firehose → Iceberg → DynamoDB
 
-Pilha CloudFormation declarada para ser vinculada a este repositório via
-**Git sync** do CloudFormation: a cada push nesta branch o serviço reaplica a
-pilha a partir de `template.yaml`, usando os parâmetros de
-`deployment-file.yaml`.
+Backend de telemetria de campo: recepção (MQTT com certificado X.509 por
+device), armazenamento (Iceberg bruto + DynamoDB agregado), tratamento (Glue
+Job de rollups e heatmap) e APIs — de consulta e de gestão da frota. **Sem
+frontend neste repositório**: a API é o produto; qualquer UI consome as rotas
+daqui de onde estiver.
+
+Pilha CloudFormation vinculada a este repositório via **Git sync**: a cada
+push nesta branch o serviço reaplica a pilha a partir de `template.yaml`,
+usando os parâmetros de `deployment-file.yaml`.
 
 ```
 template.yaml            # GERADO — não edite; é o que o Git sync aplica
@@ -26,7 +31,7 @@ infra/                   # fontes do template
     50-dynamodb.yaml
     60-glue-job.yaml
     70-api.yaml
-    80-frontend.yaml
+    75-admin-api.yaml
 
 glue/rollup_job.py       # script do Glue Job
 lambdas/                 # handlers, um arquivo por função
@@ -36,7 +41,9 @@ lambdas/                 # handlers, um arquivo por função
   api_query.py
   api_catalog.py
   api_heatmap.py
-frontend/index.html      # dashboard
+  admin_authorizer.py
+  admin_devices_read.py
+  admin_devices_write.py
 
 build/assemble.py        # monta template.yaml a partir do que está acima
 tools/simula_posicoes.py # gera e publica massa de posição para testar
@@ -61,8 +68,7 @@ resolve isso concatenando os fragmentos e expandindo marcadores:
 ```
 
 O conteúdo entra recuado até a coluna do marcador. Assim cada handler é um
-`.py` de verdade — lintável, testável, com syntax highlighting — e o
-`frontend/index.html` abre no navegador.
+`.py` de verdade — lintável, testável, com syntax highlighting.
 
 A concatenação é textual, não uma mesclagem de objetos YAML, porque
 round-trip por parser apagaria os comentários — e aqui eles carregam o porquê
@@ -381,10 +387,24 @@ olhando os mesmos devices.
 
 HTTP API (API Gateway v2), duas rotas, cada uma com sua Lambda:
 
+Consulta (abertas — proteja antes de expor publicamente):
+
 ```
 GET /devices
 GET /devices/{device_id}/metrics/{metric}?from=<ISO>&to=<ISO>[&granularity=]
 GET /devices/{device_id}/heatmap?from=<AAAA-MM-DD>&to=<AAAA-MM-DD>[&cell=]
+```
+
+Gestão da frota (exigem o header `x-api-key`; ver **API de gestão** abaixo):
+
+```
+GET    /admin/devices                                  lista os things
+GET    /admin/devices/{id}                             detalhe + certificados
+POST   /admin/devices          {"device_id": "..."}    cria thing + certificado
+POST   /admin/devices/{id}/certificates                rotaciona (novo cert)
+PATCH  /admin/devices/{id}/certificates/{cid}          {"status": ACTIVE|INACTIVE}
+DELETE /admin/devices/{id}/certificates/{cid}          revoga e apaga o cert
+DELETE /admin/devices/{id}                             descomissiona o device
 ```
 
 Nenhuma das duas faz `Scan` — a policy das funções só concede
@@ -466,47 +486,83 @@ de propósito: o que interessa testar é o artefato que a pilha vai implantar.
 Troca o DynamoDB por um stub e confere, entre outras coisas, que os prefixos de
 `sk` gerados batem com o formato que o Glue Job grava.
 
-## Dashboard
+## API de gestão
 
-`frontend/index.html` é uma página sem dependências — sem build, sem bundler,
-sem CDN — publicada pela própria pilha. A URL sai no output `SiteUrl`.
+### Autenticação
 
-O bucket do site **não é público**: quem lê é o CloudFront, via Origin Access
-Control. Isso evita bucket aberto, dá HTTPS (o endpoint de website do S3 serve
-só em HTTP) e é o que aproveita o `Cache-Control` longo que a API devolve para
-janelas já fechadas.
+As rotas `/admin/*` passam por um Lambda authorizer que compara o header
+`x-api-key` com um SecureString do Parameter Store. **A chave não existe em
+lugar nenhum deste repositório** — nem como parâmetro do CloudFormation nem no
+`deployment-file.yaml` — porque o repositório é público e o Git sync leria a
+chave dali. Crie-a fora da pilha, uma vez:
 
-A página descobre a URL da API em `config.json`, escrito pela pilha com o
-endpoint real. É por isso que o `index.html` do repositório é publicado sem
-nenhuma substituição: nada de placeholder, o arquivo que você abre no navegador
-é o que vai para o ar.
+```bash
+aws ssm put-parameter \
+  --name /iot-telemetry/admin/api-key \
+  --type SecureString \
+  --value "$(openssl rand -base64 32)"
+```
 
-O gráfico mostra a faixa mín–máx atrás da linha da média. Média sozinha apaga
-o pico, que num gráfico de sensor costuma ser exatamente o que interessa —
-é a razão de o rollup guardar as quatro estatísticas.
+Sem o parâmetro, as rotas de gestão respondem 403 para tudo — **desligadas
+por omissão, nunca abertas**. Rotacionar é `put-parameter --overwrite`: o
+authorizer recarrega o SSM ao primeiro erro, sem redeploy (o cache do gateway
+segura no máximo 60 s).
 
-A aba **Mapa** desenha o heatmap de permanência. Clicar numa célula de 153 m
-entra no detalhe de 4,8 m dela; o botão na trilha volta.
+### Provisionar um device
 
-**Sem basemap, de propósito.** Um provedor de tiles seria dependência externa
-e, para imagem de satélite, chave paga — decisão de conta, não técnica. Para
-um talhão as próprias células já desenham o formato do campo. A projeção e o
-hit-test estão isolados em `desenhaMapa` e `celulaEm`, então uma camada de
-tiles entra por baixo depois sem mexer no resto.
+```bash
+API=...; KEY=...
 
-As cores usam rampa sequencial de um único matiz, com quebras por **quantil**
-e não lineares: a distribuição de permanência é muito assimétrica — quase toda
-célula tem poucos segundos e umas poucas concentram o trabalho — e escala
-linear pintaria o campo inteiro de uma cor só. No tema escuro a rampa inverte,
-porque quem deve recuar em direção à superfície é o valor baixo.
+curl -s -X POST "$API/admin/devices" \
+  -H "x-api-key: $KEY" -H "content-type: application/json" \
+  -d '{"device_id": "trator-07"}'
+```
 
-O tile de área traz a resolução no rótulo de propósito: na célula de 153 m a
-área superestima muito, porque a célula conta inteira mesmo quando o trator só
-cruzou um canto. Só na célula fina isso vira cobertura de fato.
+```json
+{
+  "device_id": "trator-07",
+  "certificate_id": "abc123...",
+  "certificate_pem": "-----BEGIN CERTIFICATE-----...",
+  "private_key": "-----BEGIN RSA PRIVATE KEY-----...",
+  "endpoint": "xxxx-ats.iot.us-east-1.amazonaws.com",
+  "topics": {"telemetry": "devices/trator-07/telemetry",
+             "position": "devices/trator-07/position"}
+}
+```
 
-`index.html` e `config.json` sobem com `Cache-Control: max-age=60`, então o
-CloudFront revalida depois de um deploy em vez de servir versão velha. Não há
-invalidação a rodar.
+**A chave privada aparece só nessa resposta.** É gerada pela AWS e não fica
+armazenada em lugar nenhum — grave-a no device na hora. Perdeu, não recupera:
+rotaciona (`POST .../certificates`) e revoga a antiga.
+
+### Privilégio mínimo por construção
+
+Todos os certificados compartilham **uma** política, com variáveis de
+política do IoT:
+
+```
+iot:Connect   client/${iot:Connection.Thing.ThingName}   (thing anexado)
+iot:Publish   topic/devices/${iot:Connection.Thing.ThingName}/telemetry
+              topic/devices/${iot:Connection.Thing.ThingName}/position
+              topic/$aws/rules/<regra de telemetria|posição>   (basic ingest)
+```
+
+A variável resolve para o thing anexado ao certificado na conexão: o
+certificado do trator-07 só conecta como `trator-07` e só publica nos tópicos
+do trator-07 — mesmo vazado, não publica no lugar de outro device. Não há
+`Subscribe` nem `Receive`: o device desta pilha é um emissor; se um dia
+precisar receber comando, a permissão nasce aí.
+
+### Ciclo de vida do certificado
+
+Rotação sem janela: emita o novo (`POST .../certificates`), grave no device,
+confirme que conectou, e só então `PATCH` o antigo para `INACTIVE` — os dois
+coexistem ativos durante a troca. `DELETE` do certificado desativa **antes**
+de desanexar e apagar, então a conexão cai mesmo se um passo seguinte falhar.
+`DELETE` do device revoga todos os certificados e apaga o thing por último.
+
+Antes de deletar a **pilha**: descomissione os devices. A política da frota
+não pode ser removida enquanto houver certificado anexado, e o delete da
+pilha falharia nela.
 
 ## Partition spec do Iceberg
 
@@ -549,8 +605,8 @@ degrada rápido conforme o histórico cresce.
 
 - **Provisionamento de devices**: certificados X.509, IoT Policy por device e
   fleet provisioning ficam numa pilha separada, com ciclo de vida próprio.
-- **Basemap no mapa**: as células são renderizadas sem imagem por baixo.
-  Tiles de satélite exigem provedor externo e, em geral, chave paga.
+- **Frontend**: removido deste repositório de propósito. A API serve
+  qualquer UI externa; `ApiCorsOrigin` restringe a origem quando ela existir.
 - **Heatmap de frota**: hoje a partição é por trator. Um agregado por fazenda
   seria uma partição `HEAT#FLEET#<dia>` escrita pelo mesmo job.
 - **Tabela Iceberg de agregados**: hoje o rollup vai só para o DynamoDB. Se

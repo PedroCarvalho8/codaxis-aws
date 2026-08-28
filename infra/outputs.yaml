@@ -32,7 +32,3 @@
     Description: Chamada de exemplo (ajuste device, metrica e o intervalo).
     Value: !Sub >-
       ${RollupApi.ApiEndpoint}/devices/sensor-teste/metrics/temperature?from=2026-08-26T00:00:00Z&to=2026-08-27T00:00:00Z
-
-  SiteUrl:
-    Description: Dashboard servido pelo CloudFront.
-    Value: !Sub 'https://${SiteDistribution.DomainName}'

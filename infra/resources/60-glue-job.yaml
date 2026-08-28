@@ -52,9 +52,7 @@
                 Action:
                   - s3:PutObject
                   - s3:DeleteObject
-                Resource:
-                  - !Sub '${DataBucket.Arn}/scripts/*'
-                  - !Sub '${SiteBucket.Arn}/*'
+                Resource: !Sub '${DataBucket.Arn}/scripts/*'
 
   # ---------------------------------------------------------------------------
   # Glue Job - agregacao 1min / 1h / 1d
