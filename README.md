@@ -31,7 +31,7 @@ infra/                   # fontes do template
     50-dynamodb.yaml
     60-glue-job.yaml
     70-api.yaml
-    75-admin-api.yaml
+    75-fleet-api.yaml
 
 glue/rollup_job.py       # script do Glue Job
 lambdas/                 # handlers, um arquivo por função
@@ -41,9 +41,8 @@ lambdas/                 # handlers, um arquivo por função
   api_query.py
   api_catalog.py
   api_heatmap.py
-  admin_authorizer.py
-  admin_devices_read.py
-  admin_devices_write.py
+  fleet_devices_read.py
+  fleet_devices_write.py
 
 build/assemble.py        # monta template.yaml a partir do que está acima
 tools/simula_posicoes.py # gera e publica massa de posição para testar
