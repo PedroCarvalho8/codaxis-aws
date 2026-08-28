@@ -395,16 +395,16 @@ GET /devices/{device_id}/metrics/{metric}?from=<ISO>&to=<ISO>[&granularity=]
 GET /devices/{device_id}/heatmap?from=<AAAA-MM-DD>&to=<AAAA-MM-DD>[&cell=]
 ```
 
-Gestão da frota (exigem o header `x-api-key`; ver **API de gestão** abaixo):
+Gestão da frota (exigem token do Cognito; ver **API de gestão** abaixo):
 
 ```
-GET    /admin/devices                                  lista os things
-GET    /admin/devices/{id}                             detalhe + certificados
-POST   /admin/devices          {"device_id": "..."}    cria thing + certificado
-POST   /admin/devices/{id}/certificates                rotaciona (novo cert)
-PATCH  /admin/devices/{id}/certificates/{cid}          {"status": ACTIVE|INACTIVE}
-DELETE /admin/devices/{id}/certificates/{cid}          revoga e apaga o cert
-DELETE /admin/devices/{id}                             descomissiona o device
+GET    /fleet/devices                                  lista os things
+GET    /fleet/devices/{id}                             detalhe + certificados
+POST   /fleet/devices          {"device_id": "..."}    cria thing + certificado
+POST   /fleet/devices/{id}/certificates                rotaciona (novo cert)
+PATCH  /fleet/devices/{id}/certificates/{cid}          {"status": ACTIVE|INACTIVE}
+DELETE /fleet/devices/{id}/certificates/{cid}          revoga e apaga o cert
+DELETE /fleet/devices/{id}                             descomissiona o device
 ```
 
 Nenhuma das duas faz `Scan` — a policy das funções só concede
@@ -488,33 +488,53 @@ Troca o DynamoDB por um stub e confere, entre outras coisas, que os prefixos de
 
 ## API de gestão
 
-### Autenticação
+### Autenticação — Cognito User Pool
 
-As rotas `/admin/*` passam por um Lambda authorizer que compara o header
-`x-api-key` com um SecureString do Parameter Store. **A chave não existe em
-lugar nenhum deste repositório** — nem como parâmetro do CloudFormation nem no
-`deployment-file.yaml` — porque o repositório é público e o Git sync leria a
-chave dali. Crie-a fora da pilha, uma vez:
+As rotas `/fleet/*` passam pelo **JWT authorizer nativo** do HTTP API: o
+gateway valida assinatura, expiração e audience do token do Cognito antes de
+invocar qualquer Lambda. Sem token, a resposta é 401 e o código de negócio nem
+executa — não há authorizer nosso para manter.
+
+Neste momento a autorização é deliberadamente rasa: **qualquer usuário do
+pool gere a frota**. Papéis (`cognito:groups` no token, checados no handler)
+entram quando houver mais de um perfil de acesso.
+
+O pool não tem autocadastro — usuário nasce pela CLI, nunca sozinho:
 
 ```bash
-aws ssm put-parameter \
-  --name /iot-telemetry/admin/api-key \
-  --type SecureString \
-  --value "$(openssl rand -base64 32)"
+POOL=$(aws cloudformation describe-stacks --stack-name <sua-pilha> \
+  --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
+CLIENT=$(aws cloudformation describe-stacks --stack-name <sua-pilha> \
+  --query "Stacks[0].Outputs[?OutputKey=='UserPoolClientId'].OutputValue" --output text)
+
+aws cognito-idp admin-create-user \
+  --user-pool-id $POOL --username voce@exemplo.com --message-action SUPPRESS
+aws cognito-idp admin-set-user-password \
+  --user-pool-id $POOL --username voce@exemplo.com \
+  --password 'SuaSenhaForte-12+' --permanent
 ```
 
-Sem o parâmetro, as rotas de gestão respondem 403 para tudo — **desligadas
-por omissão, nunca abertas**. Rotacionar é `put-parameter --overwrite`: o
-authorizer recarrega o SSM ao primeiro erro, sem redeploy (o cache do gateway
-segura no máximo 60 s).
+Token (vale 1 h; o `RefreshToken` renova sem senha):
+
+```bash
+TOKEN=$(aws cognito-idp initiate-auth \
+  --auth-flow USER_PASSWORD_AUTH --client-id $CLIENT \
+  --auth-parameters USERNAME=voce@exemplo.com,PASSWORD='SuaSenhaForte-12+' \
+  --query 'AuthenticationResult.IdToken' --output text)
+```
+
+O User Pool **não tem** `DeletionPolicy: Retain` de propósito: enquanto o
+ambiente é de desenvolvimento, usuários morrem com a pilha e a recriação não
+esbarra no `ResourceExistenceCheck`. Antes de valer em produção, adicione
+`Retain` — e releia a seção de recursos retidos.
 
 ### Provisionar um device
 
 ```bash
-API=...; KEY=...
+API=...
 
-curl -s -X POST "$API/admin/devices" \
-  -H "x-api-key: $KEY" -H "content-type: application/json" \
+curl -s -X POST "$API/fleet/devices" \
+  -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
   -d '{"device_id": "trator-07"}'
 ```
 

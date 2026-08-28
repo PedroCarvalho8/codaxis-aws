@@ -7,8 +7,8 @@ import boto3
 iot = boto3.client("iot")
 POLICY = os.environ["DEVICE_POLICY"]
 NOME_OK = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
-# Autenticacao no Lambda authorizer da API, nao aqui: o gateway rejeita
-# antes de invocar, e a logica vive num lugar so.
+# Autenticacao no JWT authorizer nativo do gateway (Cognito User Pool):
+# requisicao sem token valido nem chega a invocar esta funcao.
 
 
 def resp(status, corpo):
@@ -60,7 +60,7 @@ def handler(event, context):
         return resp(400, {"erro": "body invalido"})
 
     try:
-        if rota == "POST /admin/devices":
+        if rota == "POST /fleet/devices":
             nome = corpo.get("device_id") or ""
             if not NOME_OK.match(nome):
                 return resp(400, {"erro": "device_id: [a-zA-Z0-9_-]{1,128}"})
@@ -70,7 +70,7 @@ def handler(event, context):
                 return resp(409, {"erro": f"device {nome} ja existe"})
             return resp(201, emite(nome))
 
-        if rota == "POST /admin/devices/{device_id}/certificates":
+        if rota == "POST /fleet/devices/{device_id}/certificates":
             iot.describe_thing(thingName=nome)   # 404 se nao existir
             return resp(201, emite(nome))
 
@@ -91,7 +91,7 @@ def handler(event, context):
             revoga(nome, arn)
             return resp(200, {"revoked": pp.get("certificate_id")})
 
-        if rota == "DELETE /admin/devices/{device_id}":
+        if rota == "DELETE /fleet/devices/{device_id}":
             arns = iot.list_thing_principals(thingName=nome)["principals"]
             for arn in arns:
                 revoga(nome, arn)

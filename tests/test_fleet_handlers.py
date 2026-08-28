@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Exercita os handlers de gestao (authorizer, leitura e escrita) sem AWS.
+"""Exercita os handlers de gestao da frota (leitura e escrita) sem AWS.
 
 Como nos outros testes, o codigo vem de dentro do template.yaml gerado -- o
 que se testa e o artefato que a pilha implanta. O cliente IoT e um stub que
 grava a ORDEM das chamadas, porque numa revogacao a ordem e o que protege:
 desativar o certificado vem antes de qualquer passo que possa falhar.
+
+A autenticacao nao aparece aqui de proposito: e o JWT authorizer nativo do
+gateway (Cognito), validado pela AWS antes de qualquer Lambda -- nao ha
+codigo nosso para testar.
 """
 
 import importlib.util
@@ -40,9 +44,6 @@ class Excecoes:
         pass
 
     class ResourceAlreadyExistsException(Exception):
-        pass
-
-    class ParameterNotFound(Exception):
         pass
 
 
@@ -120,28 +121,15 @@ class IotFake:
         return {"things": [{"thingName": n} for n in sorted(self.things)]}
 
 
-class SsmFake:
-    exceptions = Excecoes
-
-    def __init__(self):
-        self.valor = None
-
-    def get_parameter(self, Name, WithDecryption):
-        if self.valor is None:
-            raise Excecoes.ParameterNotFound()
-        return {"Parameter": {"Value": self.valor}}
-
 
 iot_fake = IotFake()
-ssm_fake = SsmFake()
-boto3.client = lambda nome, **kw: {"iot": iot_fake, "ssm": ssm_fake}[nome]
+boto3.client = lambda nome, **kw: {"iot": iot_fake}[nome]
 
 
 def carrega(recurso):
     raiz = Path(__file__).resolve().parent.parent
     template = yaml.load((raiz / "template.yaml").read_text(), Loader=Loader)
     codigo = template["Resources"][recurso]["Properties"]["Code"]["ZipFile"]
-    os.environ.setdefault("ADMIN_KEY_PARAM", "/teste/admin/api-key")
     os.environ.setdefault("DEVICE_POLICY", "politica-frota")
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
         f.write(codigo)
@@ -152,9 +140,8 @@ def carrega(recurso):
     return modulo
 
 
-authorizer = carrega("AdminAuthorizerFunction").handler
-leitura = carrega("AdminReadFunction").handler
-escrita = carrega("AdminWriteFunction").handler
+leitura = carrega("FleetReadFunction").handler
+escrita = carrega("FleetWriteFunction").handler
 
 falhas = []
 
@@ -171,26 +158,10 @@ def evento(rota, caminho=None, corpo=None):
             "body": json.dumps(corpo) if corpo else None}
 
 
-# ------------------------------------------------------------- authorizer
-checa("auth: sem parametro no SSM -> nega",
-      authorizer({"headers": {"x-api-key": "qualquer"}}, None),
-      {"isAuthorized": False})
-ssm_fake.valor = "segredo-123"
-checa("auth: chave certa apos criar o parametro (sem redeploy)",
-      authorizer({"headers": {"x-api-key": "segredo-123"}}, None),
-      {"isAuthorized": True})
-checa("auth: chave errada -> nega",
-      authorizer({"headers": {"x-api-key": "errada"}}, None),
-      {"isAuthorized": False})
-ssm_fake.valor = "segredo-456"
-checa("auth: chave rotacionada vale sem redeploy",
-      authorizer({"headers": {"x-api-key": "segredo-456"}}, None),
-      {"isAuthorized": True})
-
 # ---------------------------------------------------------------- leitura
-r = leitura(evento("GET /admin/devices"), None)
+r = leitura(evento("GET /fleet/devices"), None)
 checa("read: lista devices", json.loads(r["body"])["devices"], ["trator-01"])
-r = leitura(evento("GET /admin/devices/{device_id}",
+r = leitura(evento("GET /fleet/devices/{device_id}",
                    {"device_id": "trator-01"}), None)
 corpo = json.loads(r["body"])
 checa("read: detalhe traz endpoint",
@@ -198,11 +169,11 @@ checa("read: detalhe traz endpoint",
 checa("read: detalhe traz certificados",
       corpo["certificates"][0]["certificate_id"], "aaa111")
 checa("read: device inexistente -> 404",
-      leitura(evento("GET /admin/devices/{device_id}",
+      leitura(evento("GET /fleet/devices/{device_id}",
                      {"device_id": "nao-existe"}), None)["statusCode"], 404)
 
 # ---------------------------------------------------------------- escrita
-r = escrita(evento("POST /admin/devices", corpo={"device_id": "trator-02"}), None)
+r = escrita(evento("POST /fleet/devices", corpo={"device_id": "trator-02"}), None)
 corpo = json.loads(r["body"])
 checa("write: criacao -> 201", r["statusCode"], 201)
 checa("write: devolve a chave privada uma unica vez",
@@ -211,14 +182,14 @@ checa("write: anexa policy e thing na ordem",
       [c[0] for c in iot_fake.chamadas if c[0].startswith("attach")],
       ["attach_policy", "attach_thing_principal"])
 checa("write: nome invalido -> 400",
-      escrita(evento("POST /admin/devices",
+      escrita(evento("POST /fleet/devices",
                      corpo={"device_id": "com espaco!"}), None)["statusCode"], 400)
 checa("write: duplicado -> 409",
-      escrita(evento("POST /admin/devices",
+      escrita(evento("POST /fleet/devices",
                      corpo={"device_id": "trator-01"}), None)["statusCode"], 409)
 
 iot_fake.chamadas = []
-r = escrita(evento("DELETE /admin/devices/{device_id}/certificates/{certificate_id}",
+r = escrita(evento("DELETE /fleet/devices/{device_id}/certificates/{certificate_id}",
                    {"device_id": "trator-01", "certificate_id": "aaa111"}), None)
 checa("write: revogacao -> 200", r["statusCode"], 200)
 checa("write: revogacao desativa ANTES de desanexar e apagar",
@@ -229,12 +200,12 @@ checa("write: desativacao veio com INACTIVE",
       iot_fake.chamadas[0][1]["newStatus"], "INACTIVE")
 
 checa("write: cert de outro device -> 404",
-      escrita(evento("PATCH /admin/devices/{device_id}/certificates/{certificate_id}",
+      escrita(evento("PATCH /fleet/devices/{device_id}/certificates/{certificate_id}",
                      {"device_id": "trator-02", "certificate_id": "aaa111"},
                      corpo={"status": "INACTIVE"}), None)["statusCode"], 404)
 
 iot_fake.chamadas = []
-r = escrita(evento("DELETE /admin/devices/{device_id}",
+r = escrita(evento("DELETE /fleet/devices/{device_id}",
                    {"device_id": "trator-02"}), None)
 checa("write: descomissionar device -> 200", r["statusCode"], 200)
 checa("write: teardown revoga certs e apaga o thing por ultimo",

@@ -33,5 +33,5 @@ jobs:
       - name: handlers da API
         run: python3 tests/test_api_handler.py
 
-      - name: handlers de gestao
-        run: python3 tests/test_admin_handlers.py
+      - name: handlers da frota
+        run: python3 tests/test_fleet_handlers.py

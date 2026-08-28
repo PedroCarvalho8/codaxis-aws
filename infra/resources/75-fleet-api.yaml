@@ -1,5 +1,5 @@
   # ---------------------------------------------------------------------------
-  # Gestao de devices - provisionamento no IoT Core via API
+  # Gestao da frota - provisionamento no IoT Core via API, com Cognito
   #
   # Uma UNICA policy para toda a frota, com variaveis de politica do IoT:
   # ${iot:Connection.Thing.ThingName} resolve para o thing anexado ao
@@ -37,27 +37,28 @@
               - !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/rules/${PositionTopicRule}'
 
   # Leitura da frota: listar e inspecionar devices e certificados.
-  AdminReadFunction:
+  # (Rotas protegidas pelo JWT do Cognito -- ver FleetAuthorizer.)
+  FleetReadFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub '${ProjectName}-admin-read'
+      FunctionName: !Sub '${ProjectName}-fleet-read'
       Runtime: python3.12
       Handler: index.handler
-      Role: !GetAtt AdminReadRole.Arn
+      Role: !GetAtt FleetReadRole.Arn
       Timeout: 15
       MemorySize: 256
       Code:
         ZipFile: |
-          {{ include: lambdas/admin_devices_read.py }}
+          {{ include: lambdas/fleet_devices_read.py }}
 
   # Escrita: criar device + certificado, rotacionar, ativar/desativar, revogar.
-  AdminWriteFunction:
+  FleetWriteFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub '${ProjectName}-admin-write'
+      FunctionName: !Sub '${ProjectName}-fleet-write'
       Runtime: python3.12
       Handler: index.handler
-      Role: !GetAtt AdminWriteRole.Arn
+      Role: !GetAtt FleetWriteRole.Arn
       Timeout: 30
       MemorySize: 256
       Environment:
@@ -65,28 +66,41 @@
           DEVICE_POLICY: !Ref DevicePolicy
       Code:
         ZipFile: |
-          {{ include: lambdas/admin_devices_write.py }}
+          {{ include: lambdas/fleet_devices_write.py }}
 
-  # A chave de admin vive num SecureString do Parameter Store, criado fora da
-  # pilha -- nem em parametro do CloudFormation nem no deployment file, porque
-  # este repositorio e publico e o Git sync leria a chave dali.
-  AdminKeyReadPolicy:
-    Type: AWS::IAM::ManagedPolicy
+  # Quem gere a frota e um usuario do Cognito, nao uma chave compartilhada.
+  # Sem autocadastro: usuario nasce por admin-create-user, nunca sozinho.
+  # SEM DeletionPolicy Retain de proposito: usuarios morrem com a pilha. Antes
+  # de valer em producao, adicione Retain -- e lembre da danca do
+  # ResourceExistenceCheck ao recriar (ver secao de recursos retidos).
+  UserPool:
+    Type: AWS::Cognito::UserPool
     Properties:
-      PolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Action: ssm:GetParameter
-            Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/admin/api-key'
-          - Effect: Allow
-            Action: kms:Decrypt
-            Resource: '*'
-            Condition:
-              StringEquals:
-                kms:ViaService: !Sub 'ssm.${AWS::Region}.amazonaws.com'
+      UserPoolName: !Sub '${ProjectName}-users'
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
 
-  AdminReadRole:
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub '${ProjectName}-api'
+      # Sem secret: o mesmo client serve CLI hoje e um frontend depois.
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  FleetReadRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -117,7 +131,7 @@
                 Action: iot:DescribeCertificate
                 Resource: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:cert/*'
 
-  AdminWriteRole:
+  FleetWriteRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -165,152 +179,113 @@
                   - iot:DetachPolicy
                 Resource: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:policy/${DevicePolicy}'
 
-  # A chave de admin e comparada AQUI, no gateway, antes de qualquer Lambda
-  # de negocio ser invocada. Header x-api-key contra o SecureString do SSM.
-  AdminAuthorizerFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub '${ProjectName}-admin-authorizer'
-      Runtime: python3.12
-      Handler: index.handler
-      Role: !GetAtt AdminAuthorizerRole.Arn
-      Timeout: 10
-      MemorySize: 128
-      Environment:
-        Variables:
-          ADMIN_KEY_PARAM: !Sub '/${ProjectName}/admin/api-key'
-      Code:
-        ZipFile: |
-          {{ include: lambdas/admin_authorizer.py }}
-
-  AdminAuthorizerRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
-        - !Ref AdminKeyReadPolicy
-
-  AdminAuthorizer:
+  # JWT authorizer nativo do HTTP API: o gateway valida o token do Cognito
+  # (assinatura, expiracao, audience) sem invocar Lambda nenhuma. Requisicao
+  # sem token nem toca o codigo de negocio.
+  FleetAuthorizer:
     Type: AWS::ApiGatewayV2::Authorizer
     Properties:
       ApiId: !Ref RollupApi
-      Name: !Sub '${ProjectName}-admin-key'
-      AuthorizerType: REQUEST
-      AuthorizerPayloadFormatVersion: '2.0'
-      EnableSimpleResponses: true
-      AuthorizerUri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminAuthorizerFunction.Arn}/invocations'
+      Name: !Sub '${ProjectName}-cognito'
+      AuthorizerType: JWT
       IdentitySource:
-        - '$request.header.x-api-key'
-      # Cache por valor de chave: rotacao demora ate isto para valer no
-      # gateway; o proprio authorizer ja recarrega o SSM a cada erro.
-      AuthorizerResultTtlInSeconds: 60
+        - '$request.header.Authorization'
+      JwtConfiguration:
+        Audience:
+          - !Ref UserPoolClient
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
 
-  AdminAuthorizerInvokePermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref AdminAuthorizerFunction
-      Action: lambda:InvokeFunction
-      Principal: apigateway.amazonaws.com
-      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
-
-  AdminReadIntegration:
+  FleetReadIntegration:
     Type: AWS::ApiGatewayV2::Integration
     Properties:
       ApiId: !Ref RollupApi
       IntegrationType: AWS_PROXY
-      IntegrationUri: !GetAtt AdminReadFunction.Arn
+      IntegrationUri: !GetAtt FleetReadFunction.Arn
       PayloadFormatVersion: '2.0'
 
-  AdminWriteIntegration:
+  FleetWriteIntegration:
     Type: AWS::ApiGatewayV2::Integration
     Properties:
       ApiId: !Ref RollupApi
       IntegrationType: AWS_PROXY
-      IntegrationUri: !GetAtt AdminWriteFunction.Arn
+      IntegrationUri: !GetAtt FleetWriteFunction.Arn
       PayloadFormatVersion: '2.0'
 
-  AdminListRoute:
+  FleetListRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'GET /admin/devices'
-      AuthorizationType: CUSTOM
-      AuthorizerId: !Ref AdminAuthorizer
-      Target: !Sub 'integrations/${AdminReadIntegration}'
+      RouteKey: 'GET /fleet/devices'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref FleetAuthorizer
+      Target: !Sub 'integrations/${FleetReadIntegration}'
 
-  AdminDetailRoute:
+  FleetDetailRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'GET /admin/devices/{device_id}'
-      AuthorizationType: CUSTOM
-      AuthorizerId: !Ref AdminAuthorizer
-      Target: !Sub 'integrations/${AdminReadIntegration}'
+      RouteKey: 'GET /fleet/devices/{device_id}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref FleetAuthorizer
+      Target: !Sub 'integrations/${FleetReadIntegration}'
 
-  AdminCreateRoute:
+  FleetCreateRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'POST /admin/devices'
-      AuthorizationType: CUSTOM
-      AuthorizerId: !Ref AdminAuthorizer
-      Target: !Sub 'integrations/${AdminWriteIntegration}'
+      RouteKey: 'POST /fleet/devices'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref FleetAuthorizer
+      Target: !Sub 'integrations/${FleetWriteIntegration}'
 
-  AdminRotateRoute:
+  FleetRotateRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'POST /admin/devices/{device_id}/certificates'
-      AuthorizationType: CUSTOM
-      AuthorizerId: !Ref AdminAuthorizer
-      Target: !Sub 'integrations/${AdminWriteIntegration}'
+      RouteKey: 'POST /fleet/devices/{device_id}/certificates'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref FleetAuthorizer
+      Target: !Sub 'integrations/${FleetWriteIntegration}'
 
-  AdminCertStatusRoute:
+  FleetCertStatusRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'PATCH /admin/devices/{device_id}/certificates/{certificate_id}'
-      AuthorizationType: CUSTOM
-      AuthorizerId: !Ref AdminAuthorizer
-      Target: !Sub 'integrations/${AdminWriteIntegration}'
+      RouteKey: 'PATCH /fleet/devices/{device_id}/certificates/{certificate_id}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref FleetAuthorizer
+      Target: !Sub 'integrations/${FleetWriteIntegration}'
 
-  AdminRevokeCertRoute:
+  FleetRevokeCertRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'DELETE /admin/devices/{device_id}/certificates/{certificate_id}'
-      AuthorizationType: CUSTOM
-      AuthorizerId: !Ref AdminAuthorizer
-      Target: !Sub 'integrations/${AdminWriteIntegration}'
+      RouteKey: 'DELETE /fleet/devices/{device_id}/certificates/{certificate_id}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref FleetAuthorizer
+      Target: !Sub 'integrations/${FleetWriteIntegration}'
 
-  AdminDeleteDeviceRoute:
+  FleetDeleteDeviceRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref RollupApi
-      RouteKey: 'DELETE /admin/devices/{device_id}'
-      AuthorizationType: CUSTOM
-      AuthorizerId: !Ref AdminAuthorizer
-      Target: !Sub 'integrations/${AdminWriteIntegration}'
+      RouteKey: 'DELETE /fleet/devices/{device_id}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref FleetAuthorizer
+      Target: !Sub 'integrations/${FleetWriteIntegration}'
 
-  AdminReadInvokePermission:
+  FleetReadInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
-      FunctionName: !Ref AdminReadFunction
+      FunctionName: !Ref FleetReadFunction
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'
 
-  AdminWriteInvokePermission:
+  FleetWriteInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
-      FunctionName: !Ref AdminWriteFunction
+      FunctionName: !Ref FleetWriteFunction
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RollupApi}/*'

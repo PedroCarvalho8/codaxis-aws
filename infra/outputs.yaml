@@ -32,3 +32,11 @@
     Description: Chamada de exemplo (ajuste device, metrica e o intervalo).
     Value: !Sub >-
       ${RollupApi.ApiEndpoint}/devices/sensor-teste/metrics/temperature?from=2026-08-26T00:00:00Z&to=2026-08-27T00:00:00Z
+
+  UserPoolId:
+    Description: User Pool do Cognito que autentica a API de gestao da frota.
+    Value: !Ref UserPool
+
+  UserPoolClientId:
+    Description: Client usado no initiate-auth para obter o token JWT.
+    Value: !Ref UserPoolClient

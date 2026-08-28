@@ -3,8 +3,8 @@ import json
 import boto3
 
 iot = boto3.client("iot")
-# Autenticacao no Lambda authorizer da API, nao aqui: o gateway rejeita
-# antes de invocar, e a logica vive num lugar so.
+# Autenticacao no JWT authorizer nativo do gateway (Cognito User Pool):
+# requisicao sem token valido nem chega a invocar esta funcao.
 _cache = {}
 
 
@@ -46,7 +46,7 @@ def handler(event, context):
     caminho = event.get("pathParameters") or {}
     consulta = event.get("queryStringParameters") or {}
 
-    if rota == "GET /admin/devices":
+    if rota == "GET /fleet/devices":
         extra = {}
         if consulta.get("next"):
             extra["nextToken"] = consulta["next"]
@@ -56,7 +56,7 @@ def handler(event, context):
             "next": pagina.get("nextToken"),
         })
 
-    if rota == "GET /admin/devices/{device_id}":
+    if rota == "GET /fleet/devices/{device_id}":
         nome = caminho.get("device_id")
         try:
             iot.describe_thing(thingName=nome)
